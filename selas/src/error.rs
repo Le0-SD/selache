@@ -12,6 +12,7 @@ pub enum Error {
     UnknownMnemonic { line: u32, text: String },
     UnknownRegister { line: u32, name: String },
     UnknownCondition { line: u32, name: String },
+    Encode(selinstr::encode::EncodeError),
     MissingArgument(String),
     NoInput,
 }
@@ -30,6 +31,7 @@ impl fmt::Display for Error {
             Error::UnknownCondition { line, name } => {
                 write!(f, "line {line}: unknown condition: {name}")
             }
+            Error::Encode(e) => write!(f, "{e}"),
             Error::MissingArgument(what) => write!(f, "missing argument: {what}"),
             Error::NoInput => write!(f, "no input file specified"),
         }
@@ -37,6 +39,12 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<selinstr::encode::EncodeError> for Error {
+    fn from(e: selinstr::encode::EncodeError) -> Self {
+        Error::Encode(e)
+    }
+}
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {

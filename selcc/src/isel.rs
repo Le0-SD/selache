@@ -13,7 +13,8 @@ use crate::mach::{MachInstr, Reloc, RelocKind};
 use crate::target;
 
 use selinstr::encode::{
-    AluOp, BranchTarget, ComputeOp, FaluOp, Instruction, MemAccess, MemWidth, MulOp, ShiftOp,
+    AluOp, BranchTarget, ComputeOp, DagWidth, FaluOp, Instruction, MemAccess, MemWidth, MulOp,
+    ShiftOp,
 };
 
 /// Result of instruction selection for one function.
@@ -458,6 +459,7 @@ pub fn select_with_name(
                         cond: target::COND_TRUE,
                         compute: None,
                         post_modify: false,
+                        width: DagWidth::Normal,
                     },
                     reloc: None,
                 });
@@ -473,6 +475,7 @@ pub fn select_with_name(
                         pm_m: 6,
                         delayed: true,
                         compute: None,
+                        else_compute: false,
                     },
                     reloc: None,
                 });
@@ -589,6 +592,7 @@ pub fn select_with_name(
                         cond: target::COND_TRUE,
                         compute: None,
                         post_modify: false,
+                        width: DagWidth::Normal,
                     },
                     reloc: None,
                 });
@@ -600,6 +604,7 @@ pub fn select_with_name(
                         pm_m: 6,
                         delayed: true,
                         compute: None,
+                        else_compute: false,
                     },
                     reloc: None,
                 });
@@ -665,6 +670,7 @@ pub fn select_with_name(
                                     cond: target::COND_TRUE,
                                     compute: None,
                                     post_modify: true,
+                                    width: DagWidth::Normal,
                                 },
                                 reloc: None,
                             });
@@ -707,6 +713,7 @@ pub fn select_with_name(
                                     cond: target::COND_TRUE,
                                     compute: None,
                                     post_modify: true,
+                                    width: DagWidth::Normal,
                                 },
                                 reloc: None,
                             });
@@ -744,6 +751,7 @@ pub fn select_with_name(
                     instr: Instruction::CJump {
                         addr: 0,
                         delayed: true,
+                        relative: false,
                     },
                     reloc: Some(Reloc {
                         symbol: name.clone(),
@@ -765,6 +773,7 @@ pub fn select_with_name(
                         cond: target::COND_TRUE,
                         compute: None,
                         post_modify: true,
+                        width: DagWidth::Normal,
                     },
                     reloc: None,
                 });
@@ -800,6 +809,7 @@ pub fn select_with_name(
                             value: stack_arg_count as i32,
                             width: MemWidth::Nw,
                             bitrev: false,
+                            dest_xor: 0,
                         },
                         reloc: None,
                     });
@@ -854,6 +864,7 @@ pub fn select_with_name(
                                 cond: target::COND_TRUE,
                                 compute: None,
                                 post_modify: true,
+                                width: DagWidth::Normal,
                             },
                             reloc: None,
                         });
@@ -925,6 +936,7 @@ pub fn select_with_name(
                         pm_m: 5,
                         delayed: true,
                         compute: None,
+                        else_compute: false,
                     },
                     reloc: None,
                 });
@@ -939,6 +951,7 @@ pub fn select_with_name(
                         cond: target::COND_TRUE,
                         compute: None,
                         post_modify: true,
+                        width: DagWidth::Normal,
                     },
                     reloc: None,
                 });
@@ -1013,6 +1026,7 @@ pub fn select_with_name(
                                 cond: target::COND_TRUE,
                                 compute: None,
                                 post_modify: true,
+                                width: DagWidth::Normal,
                             },
                             reloc: None,
                         });
@@ -1047,6 +1061,7 @@ pub fn select_with_name(
                     instr: Instruction::CJump {
                         addr: 0,
                         delayed: true,
+                        relative: false,
                     },
                     reloc: Some(Reloc {
                         symbol: name.clone(),
@@ -1063,6 +1078,7 @@ pub fn select_with_name(
                         cond: target::COND_TRUE,
                         compute: None,
                         post_modify: true,
+                        width: DagWidth::Normal,
                     },
                     reloc: None,
                 });
@@ -1089,6 +1105,7 @@ pub fn select_with_name(
                             value: stack_arg_count as i32,
                             width: MemWidth::Nw,
                             bitrev: false,
+                            dest_xor: 0,
                         },
                         reloc: None,
                     });
@@ -1140,6 +1157,7 @@ pub fn select_with_name(
                                 cond: target::COND_TRUE,
                                 compute: None,
                                 post_modify: true,
+                                width: DagWidth::Normal,
                             },
                             reloc: None,
                         });
@@ -1190,6 +1208,7 @@ pub fn select_with_name(
                         pm_m: 5,
                         delayed: true,
                         compute: None,
+                        else_compute: false,
                     },
                     reloc: None,
                 });
@@ -1203,6 +1222,7 @@ pub fn select_with_name(
                         cond: target::COND_TRUE,
                         compute: None,
                         post_modify: true,
+                        width: DagWidth::Normal,
                     },
                     reloc: None,
                 });
@@ -1250,6 +1270,7 @@ pub fn select_with_name(
                         cond: target::COND_TRUE,
                         delayed: false,
                         target: BranchTarget::PcRelative(*label as i32),
+                        loop_abort: false,
                     },
                     reloc: None,
                 });
@@ -1263,6 +1284,7 @@ pub fn select_with_name(
                         cond: cond_code,
                         delayed: false,
                         target: BranchTarget::PcRelative(*label as i32),
+                        loop_abort: false,
                     },
                     reloc: None,
                 });
@@ -1360,6 +1382,7 @@ pub fn select_with_name(
                         write: true,
                         ureg: *val as u16,
                         addr: 0,
+                        width: DagWidth::Normal,
                     },
                     reloc: Some(Reloc {
                         symbol: name.clone(),
@@ -1376,6 +1399,7 @@ pub fn select_with_name(
                         write: false,
                         ureg: *dst as u16,
                         addr: 0,
+                        width: DagWidth::Normal,
                     },
                     reloc: Some(Reloc {
                         symbol: name.clone(),
@@ -1798,6 +1822,7 @@ pub fn select_with_name(
                     instr: Instruction::DoLoop {
                         counter: selinstr::encode::LoopCounter::Immediate(*count as u16),
                         end_pc: *end_label,
+                        f: false,
                     },
                     reloc: None,
                 });
@@ -1807,6 +1832,7 @@ pub fn select_with_name(
                     instr: Instruction::DoLoop {
                         counter: selinstr::encode::LoopCounter::Ureg(*count as u8),
                         end_pc: *end_label,
+                        f: false,
                     },
                     reloc: None,
                 });
@@ -1924,6 +1950,7 @@ pub fn select_with_name(
                             value: frame_offset,
                             width: MemWidth::Nw,
                             bitrev: false,
+                            dest_xor: 0,
                         },
                         reloc: None,
                     });
@@ -1942,6 +1969,7 @@ pub fn select_with_name(
                             value: -frame_offset,
                             width: MemWidth::Nw,
                             bitrev: false,
+                            dest_xor: 0,
                         },
                         reloc: None,
                     });
@@ -1975,6 +2003,7 @@ pub fn select_with_name(
                             value: offset,
                             width: MemWidth::Nw,
                             bitrev: false,
+                            dest_xor: 0,
                         },
                         reloc: None,
                     });
@@ -2020,6 +2049,7 @@ pub fn select_with_name(
                             value: offset,
                             width: MemWidth::Nw,
                             bitrev: false,
+                            dest_xor: 0,
                         },
                         reloc: None,
                     });
@@ -2039,6 +2069,7 @@ pub fn select_with_name(
                         cond: target::COND_TRUE,
                         compute: None,
                         post_modify: true,
+                        width: DagWidth::Normal,
                     },
                     reloc: None,
                 });
@@ -2436,6 +2467,7 @@ pub fn select_with_name(
                         cond: target::COND_NE,
                         delayed: false,
                         target: BranchTarget::PcRelative(skip_label as i32),
+                        loop_abort: false,
                     },
                     reloc: None,
                 });
@@ -2499,6 +2531,8 @@ pub fn select_with_name(
                             dreg: dst_lo,
                             offset: *offset as i8,
                             cond: target::COND_TRUE,
+                            post_modify: false,
+                            width: selinstr::encode::DagWidth::Normal,
                         },
                         reloc: None,
                     });
@@ -2514,6 +2548,8 @@ pub fn select_with_name(
                             dreg: dst_hi,
                             offset: (*offset + 1) as i8,
                             cond: target::COND_TRUE,
+                            post_modify: false,
+                            width: selinstr::encode::DagWidth::Normal,
                         },
                         reloc: None,
                     });
@@ -2554,6 +2590,8 @@ pub fn select_with_name(
                             dreg: src_lo,
                             offset: *offset as i8,
                             cond: target::COND_TRUE,
+                            post_modify: false,
+                            width: selinstr::encode::DagWidth::Normal,
                         },
                         reloc: None,
                     });
@@ -2568,6 +2606,8 @@ pub fn select_with_name(
                             dreg: src_hi,
                             offset: (*offset + 1) as i8,
                             cond: target::COND_TRUE,
+                            post_modify: false,
+                            width: selinstr::encode::DagWidth::Normal,
                         },
                         reloc: None,
                     });
@@ -2648,6 +2688,8 @@ fn emit_frame_access(instrs: &mut Vec<MachInstr>, offset: i32, dreg: u16, write:
                 dreg,
                 offset: offset as i8,
                 cond: target::COND_TRUE,
+                post_modify: false,
+                width: selinstr::encode::DagWidth::Normal,
             },
             reloc: None,
         });
@@ -2661,6 +2703,7 @@ fn emit_frame_access(instrs: &mut Vec<MachInstr>, offset: i32, dreg: u16, write:
                 value: offset,
                 width: MemWidth::Nw,
                 bitrev: false,
+                dest_xor: 0,
             },
             reloc: None,
         });
@@ -2675,6 +2718,8 @@ fn emit_frame_access(instrs: &mut Vec<MachInstr>, offset: i32, dreg: u16, write:
                 dreg,
                 offset: 0,
                 cond: target::COND_TRUE,
+                post_modify: false,
+                width: selinstr::encode::DagWidth::Normal,
             },
             reloc: None,
         });
@@ -2684,6 +2729,7 @@ fn emit_frame_access(instrs: &mut Vec<MachInstr>, offset: i32, dreg: u16, write:
                 value: -offset,
                 width: MemWidth::Nw,
                 bitrev: false,
+                dest_xor: 0,
             },
             reloc: None,
         });
@@ -2732,6 +2778,7 @@ fn emit_indirect_access(
                 value: offset as i32,
                 width: MemWidth::Normal,
                 bitrev: false,
+                dest_xor: 0,
             },
             reloc: None,
         });
@@ -2752,6 +2799,7 @@ fn emit_indirect_access(
             cond: target::COND_TRUE,
             compute: None,
             post_modify: true,
+            width: DagWidth::Normal,
         },
         reloc: None,
     });
@@ -2762,6 +2810,7 @@ fn emit_indirect_access(
                 value: -(offset as i32),
                 width: MemWidth::Normal,
                 bitrev: false,
+                dest_xor: 0,
             },
             reloc: None,
         });
@@ -3645,6 +3694,7 @@ fn emit_runtime_call_64_divmod(
         instr: Instruction::CJump {
             addr: 0,
             delayed: true,
+            relative: false,
         },
         reloc: Some(Reloc {
             symbol: name.to_string(),
@@ -3662,6 +3712,7 @@ fn emit_runtime_call_64_divmod(
             cond: target::COND_TRUE,
             compute: None,
             post_modify: true,
+            width: DagWidth::Normal,
         },
         reloc: None,
     });
@@ -3716,6 +3767,7 @@ fn emit_runtime_call_64_c_abi(
             cond: target::COND_TRUE,
             compute: None,
             post_modify: true,
+            width: DagWidth::Normal,
         },
         reloc: None,
     });
@@ -3727,6 +3779,7 @@ fn emit_runtime_call_64_c_abi(
         instr: Instruction::CJump {
             addr: 0,
             delayed: true,
+            relative: false,
         },
         reloc: Some(Reloc {
             symbol: name.to_string(),
@@ -3743,6 +3796,7 @@ fn emit_runtime_call_64_c_abi(
             cond: target::COND_TRUE,
             compute: None,
             post_modify: true,
+            width: DagWidth::Normal,
         },
         reloc: None,
     });
@@ -3820,6 +3874,7 @@ fn emit_runtime_call_32_divmod(
         instr: Instruction::CJump {
             addr: 0,
             delayed: true,
+            relative: false,
         },
         reloc: Some(Reloc {
             symbol: name.to_string(),
@@ -3836,6 +3891,7 @@ fn emit_runtime_call_32_divmod(
             cond: target::COND_TRUE,
             compute: None,
             post_modify: true,
+            width: DagWidth::Normal,
         },
         reloc: None,
     });

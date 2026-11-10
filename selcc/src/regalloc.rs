@@ -219,6 +219,8 @@ fn emit_spill_access(out: &mut Vec<MachInstr>, slot: u32, dreg: u16, write: bool
                 dreg,
                 offset: slot as i8,
                 cond: target::COND_TRUE,
+                post_modify: false,
+                width: selinstr::encode::DagWidth::Normal,
             },
             reloc: None,
         });
@@ -234,6 +236,7 @@ fn emit_spill_access(out: &mut Vec<MachInstr>, slot: u32, dreg: u16, write: bool
             value: slot as i32,
             width: MemWidth::Nw,
             bitrev: false,
+            dest_xor: 0,
         },
         reloc: None,
     });
@@ -244,6 +247,8 @@ fn emit_spill_access(out: &mut Vec<MachInstr>, slot: u32, dreg: u16, write: bool
             dreg,
             offset: 0,
             cond: target::COND_TRUE,
+            post_modify: false,
+            width: selinstr::encode::DagWidth::Normal,
         },
         reloc: None,
     });
@@ -253,6 +258,7 @@ fn emit_spill_access(out: &mut Vec<MachInstr>, slot: u32, dreg: u16, write: bool
             value: -(slot as i32),
             width: MemWidth::Nw,
             bitrev: false,
+            dest_xor: 0,
         },
         reloc: None,
     });
@@ -366,8 +372,17 @@ fn collect_mul_refs(mul: &MulOp, refs: &mut VRegRefs) {
             add_vreg_use(refs, rx);
             add_vreg_use(refs, ry);
         }
+        // `ddyx f??r`: dd 00/01 write Rn, 10/11 write MRF/MRB.
+        FixedMul { opcode, rn, rx, ry } => {
+            if opcode & 0x04 == 0 {
+                add_vreg_def(refs, rn);
+            }
+            add_vreg_use(refs, rx);
+            add_vreg_use(refs, ry);
+        }
         SatMrf { rn }
         | SatMrb { rn }
+        | MrToReg { rn, .. }
         | TrncMrfReg { rn }
         | TrncMrbReg { rn }
         | ReadMr0f { rn }
@@ -387,6 +402,12 @@ fn collect_mul_refs(mul: &MulOp, refs: &mut VRegRefs) {
 
 fn collect_falu_refs(falu: &FaluOp, refs: &mut VRegRefs) {
     match *falu {
+        FaluOp::DualAddSub { rn, rs, rx, ry } => {
+            add_vreg_use(refs, rx);
+            add_vreg_use(refs, ry);
+            add_vreg_def(refs, rn);
+            add_vreg_def(refs, rs);
+        }
         FaluOp::Comp { rx, ry } => {
             add_vreg_use(refs, rx);
             add_vreg_use(refs, ry);
@@ -457,6 +478,8 @@ fn collect_shift_refs(shift: &ShiftOp, refs: &mut VRegRefs) {
             add_vreg_def(refs, rn);
             add_vreg_use(refs, rx);
         }
+        BffwrpRead { rn } => add_vreg_def(refs, rn),
+        BffwrpWrite { ry } => add_vreg_use(refs, ry),
     }
 }
 
@@ -1314,6 +1337,7 @@ impl Allocator {
                 cond,
                 target,
                 delayed,
+                loop_abort,
             } => {
                 // Jump-source flush: a Branch ends the current basic
                 // block, so every vreg live across the outgoing edge
@@ -1359,6 +1383,7 @@ impl Allocator {
                     cond,
                     target,
                     delayed,
+                    loop_abort,
                 }
             }
 
@@ -1368,6 +1393,8 @@ impl Allocator {
                 dreg,
                 offset,
                 cond,
+                post_modify,
+                width,
             } => {
                 let new_compute = compute.map(|c| self.rewrite_compute(&c, &mut spill_pre));
                 let new_dreg = self.get_phys(dreg, &mut spill_pre);
@@ -1377,6 +1404,8 @@ impl Allocator {
                     dreg: new_dreg,
                     offset,
                     cond,
+                    post_modify,
+                    width,
                 }
             }
 
@@ -1474,11 +1503,13 @@ impl Allocator {
             Instruction::DoLoop {
                 counter: LoopCounter::Ureg(ureg),
                 end_pc,
+                f,
             } => {
                 let phys = self.get_phys(ureg as u16, &mut spill_pre);
                 Instruction::DoLoop {
                     counter: LoopCounter::Ureg(phys as u8),
                     end_pc,
+                    f,
                 }
             }
 
@@ -1496,6 +1527,7 @@ impl Allocator {
             | Instruction::BitOp { .. }
             | Instruction::StackOp { .. }
             | Instruction::DagModify { .. }
+            | Instruction::DagConvert { .. }
             | Instruction::RegisterSwap { .. }
             | Instruction::ImmShift { .. }
             | Instruction::ImmStore { .. }
@@ -1510,6 +1542,7 @@ impl Allocator {
                 cond,
                 compute,
                 post_modify,
+                width,
             } => {
                 // Tag-bit + I/M-group nibble identifies a fixed
                 // I/M/R-register encoding (R2 push for CJUMP delay
@@ -1538,6 +1571,7 @@ impl Allocator {
                     cond,
                     compute: new_compute,
                     post_modify,
+                    width,
                 }
             }
 
@@ -1546,6 +1580,7 @@ impl Allocator {
                 write,
                 ureg,
                 addr,
+                width,
             } => {
                 let is_fixed = |u: u16| {
                     u & target::UREG_FIXED_TAG != 0 && ((u & 0x70) == 0x10 || (u & 0x70) == 0x20)
@@ -1556,6 +1591,7 @@ impl Allocator {
                         write,
                         ureg: ureg & !target::UREG_FIXED_TAG,
                         addr,
+                        width,
                     }
                 } else {
                     let phys = self.get_phys(ureg, &mut spill_pre);
@@ -1564,6 +1600,7 @@ impl Allocator {
                         write,
                         ureg: target::ureg_r(phys),
                         addr,
+                        width,
                     }
                 }
             }
@@ -1630,7 +1667,7 @@ impl Allocator {
             }
 
             // Assembly-only instruction types not produced by selcc
-            Instruction::ImmShiftMem { .. } => mi.instr,
+            Instruction::ImmShiftMem { .. } | Instruction::ComputeBranch { .. } => mi.instr,
         };
 
         // Emit any spill/reload instructions before the main instruction.
@@ -1868,6 +1905,16 @@ impl Allocator {
                 rx: self.get_phys(rx, spill),
                 ry: self.get_phys(ry, spill),
             },
+            FixedMul { opcode, rn, rx, ry } => FixedMul {
+                opcode,
+                rn: if opcode & 0x04 == 0 {
+                    self.get_phys(rn, spill)
+                } else {
+                    rn
+                },
+                rx: self.get_phys(rx, spill),
+                ry: self.get_phys(ry, spill),
+            },
             MulSsi { rn, rx, ry } => MulSsi {
                 rn: self.get_phys(rn, spill),
                 rx: self.get_phys(rx, spill),
@@ -1915,6 +1962,10 @@ impl Allocator {
                 rn: self.get_phys(rn, spill),
             },
             SatMrb { rn } => SatMrb {
+                rn: self.get_phys(rn, spill),
+            },
+            MrToReg { opcode, rn } => MrToReg {
+                opcode,
                 rn: self.get_phys(rn, spill),
             },
             ClrMrf => ClrMrf,
@@ -1976,6 +2027,12 @@ impl Allocator {
 
     fn rewrite_falu(&mut self, falu: &FaluOp, spill: &mut Vec<MachInstr>) -> FaluOp {
         match *falu {
+            FaluOp::DualAddSub { rn, rs, rx, ry } => FaluOp::DualAddSub {
+                rn: self.get_phys(rn, spill),
+                rs: self.get_phys(rs, spill),
+                rx: self.get_phys(rx, spill),
+                ry: self.get_phys(ry, spill),
+            },
             FaluOp::Add { rn, rx, ry } => FaluOp::Add {
                 rn: self.get_phys(rn, spill),
                 rx: self.get_phys(rx, spill),
@@ -2187,6 +2244,12 @@ impl Allocator {
                 rn: self.get_phys(rn, spill),
                 rx: self.get_phys(rx, spill),
             },
+            BffwrpRead { rn } => BffwrpRead {
+                rn: self.get_phys(rn, spill),
+            },
+            BffwrpWrite { ry } => BffwrpWrite {
+                ry: self.get_phys(ry, spill),
+            },
         }
     }
 }
@@ -2195,6 +2258,7 @@ impl Allocator {
 mod tests {
     use super::*;
     use crate::mach::MachInstr;
+    use selinstr::encode::DagWidth;
 
     #[test]
     fn allocate_simple() {
@@ -2253,6 +2317,7 @@ mod tests {
                     cond: 1,
                     target: BranchTarget::PcRelative(99),
                     delayed: false,
+                    loop_abort: false,
                 },
                 reloc: None,
             },
@@ -2401,6 +2466,7 @@ mod tests {
                     cond: 1, // conditional: keeps the fall-through edge too
                     target: BranchTarget::PcRelative(7),
                     delayed: false,
+                    loop_abort: false,
                 },
                 reloc: None,
             },
@@ -2571,6 +2637,7 @@ mod tests {
                 instr: Instruction::CJump {
                     addr: 0,
                     delayed: true,
+                    relative: false,
                 },
                 reloc: None,
             },
@@ -2632,6 +2699,7 @@ mod tests {
                     pm_m: DAG_M_ZERO,
                     delayed: true,
                     compute: None,
+                    else_compute: false,
                 },
                 reloc: None,
             },
@@ -2645,6 +2713,7 @@ mod tests {
                     cond: target::COND_TRUE,
                     compute: None,
                     post_modify: true,
+                    width: DagWidth::Normal,
                 },
                 reloc: None,
             },

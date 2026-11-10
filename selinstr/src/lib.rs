@@ -12,7 +12,7 @@ pub mod visa_encode;
 /// `decode_instruction` so callers automatically stay in sync with the
 /// round-trip boundary used by selas's asm parser.
 pub fn instruction_to_text(instr: &encode::Instruction) -> Result<String, encode::EncodeError> {
-    // Instructions whose 48-bit ISA encoding is not modelled by this
+    // Instructions whose 48-bit ISA decoding is not modelled by this
     // toolchain need direct text output: the encode-then-decode round
     // trip would lose them. Currently only RFRAME falls in this bucket.
     if matches!(instr, encode::Instruction::Rframe) {

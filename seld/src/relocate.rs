@@ -2,6 +2,8 @@
 // relocate.rs --- Relocation processing for SHARC ELF objects
 // Copyright (c) 2026 Jakob Kastelic
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use selelf::elf::{
     self, Elf32Rela, R_SHARC_ADDR32, R_SHARC_ADDR_VAR, R_SHARC_DATA16, R_SHARC_DATA32,
     R_SHARC_DATA6, R_SHARC_DATA7, R_SHARC_DM_ADDR32, R_SHARC_NONE, R_SHARC_PCREL, R_SHARC_PM24,
@@ -351,6 +353,102 @@ fn patch_pm24(data: &mut [u8], offset: usize, value: u32) {
     data[offset + 5] = (value & 0xff) as u8;
 }
 
+/// Evaluate the vendor postfix form, then write once using its terminal
+/// relocation. e1 pushes a constant; e2/e3 select addition/subtraction.
+/// The old per-entry interpretation happened to handle subtraction, but
+/// turned a module's `_mod_params + 4` into `_mod_params - 4`.
+/// Only the vendor-linked PM32 terminal is supported here. In particular,
+/// a LOOP16 expression's relative-address semantics need a linked vector.
+fn evaluate_postfix_pm32(
+    entries: &[(&Elf32Rela, &str, u32)],
+    section_name: &str,
+    object_path: &str,
+) -> Result<u32> {
+    let fail = |reason: &str| {
+        Error::Relocation(format!(
+            "postfix expression in `{section_name}` of `{object_path}`: {reason}"
+        ))
+    };
+    let Some(((terminal, terminal_name, _), operands)) = entries.split_last() else {
+        return Err(fail("empty expression"));
+    };
+    if terminal.r_info & 0xff != R_SHARC_PM32
+        || *terminal_name != SYM_OPERATOR
+        || terminal.r_addend != 0
+    {
+        return Err(fail(
+            "unsupported or missing terminal; expected PM32 with .__operator",
+        ));
+    }
+    let mut stack: Vec<u32> = Vec::new();
+    for &(rela, name, address) in operands {
+        match rela.r_info & 0xff {
+            R_SHARC_PM_SW_BRANCHRETURN if name != SYM_OPERATOR && name != SYM_CONSTANT => {
+                stack.push(address.wrapping_add(rela.r_addend as u32));
+            }
+            R_SHARC_PM32_SUB if name == SYM_CONSTANT => stack.push(rela.r_addend as u32),
+            op @ (R_SHARC_PM_EXPR_ADD | R_SHARC_PM_EXPR_MARKER)
+                if name == SYM_OPERATOR && rela.r_addend == 0 =>
+            {
+                let rhs = stack
+                    .pop()
+                    .ok_or_else(|| fail("operator stack underflow"))?;
+                let lhs = stack
+                    .pop()
+                    .ok_or_else(|| fail("operator stack underflow"))?;
+                stack.push(if op == R_SHARC_PM_EXPR_ADD {
+                    lhs.wrapping_add(rhs)
+                } else {
+                    lhs.wrapping_sub(rhs)
+                });
+            }
+            _ => return Err(fail("unsupported operand, operator or misplaced terminal")),
+        }
+    }
+    if stack.len() != 1 {
+        return Err(fail("terminal requires exactly one result"));
+    }
+    Ok(stack[0])
+}
+
+fn resolve_relocation_symbol(
+    sym: &elf::Elf32Sym,
+    sym_name: &str,
+    obj_idx: usize,
+    symtab: &SymbolTable,
+    placed: &[PlacedSection],
+) -> Result<u32> {
+    if sym.st_shndx == SHN_UNDEF {
+        let resolved = symtab
+            .symbols
+            .get(sym_name)
+            .or_else(|| {
+                crate::resolve::name_aliases(sym_name)
+                    .into_iter()
+                    .find_map(|a| symtab.symbols.get(&a))
+            })
+            .ok_or_else(|| Error::UnresolvedSymbol(sym_name.to_string()))?;
+        // LDF constants are already final addresses, without a section.
+        if resolved.section_idx == 0xfff1 {
+            return Ok(resolved.value);
+        }
+        find_symbol_address(
+            resolved.object_idx,
+            resolved.section_idx as usize,
+            resolved.value,
+            placed,
+        )
+        .ok_or_else(|| {
+            Error::Relocation(format!(
+                "symbol `{sym_name}` resolved but no placed section found"
+            ))
+        })
+    } else {
+        find_symbol_address(obj_idx, sym.st_shndx as usize, sym.st_value, placed)
+            .ok_or_else(|| Error::Relocation(format!("symbol `{sym_name}` section not placed")))
+    }
+}
+
 /// Apply all relocations, patching placed section data in place.
 pub fn apply_relocations(
     objects: &[InputObject],
@@ -375,11 +473,72 @@ pub fn apply_relocations(
             if !home_placed {
                 continue;
             }
+            // Keep all entries at an offset together even if the object
+            // interleaves different sites. Entry order within each site
+            // is the postfix program's execution order.
+            let mut by_offset: BTreeMap<u32, Vec<&Elf32Rela>> = BTreeMap::new();
+            for rela in relas {
+                by_offset.entry(rela.r_offset).or_default().push(rela);
+            }
+            let mut postfix_offsets = BTreeSet::new();
+            for (offset, group) in by_offset {
+                let is_postfix = group.iter().any(|r| {
+                    matches!(
+                        r.r_info & 0xff,
+                        R_SHARC_PM32_SUB | R_SHARC_PM_EXPR_ADD | R_SHARC_PM_EXPR_MARKER
+                    ) || syms
+                        .get((r.r_info >> 8) as usize)
+                        .is_some_and(|(_, name)| name == SYM_OPERATOR)
+                });
+                if !is_postfix {
+                    continue;
+                }
+                let mut entries = Vec::new();
+                for rela in group {
+                    let sym_idx = (rela.r_info >> 8) as usize;
+                    let (sym, name) = syms.get(sym_idx).ok_or_else(|| {
+                        Error::Relocation(format!(
+                        "relocation references symbol index {sym_idx} but only {} symbols in {}",
+                        syms.len(), obj.path
+                    ))
+                    })?;
+                    let address = if rela.r_info & 0xff == R_SHARC_PM_SW_BRANCHRETURN {
+                        resolve_relocation_symbol(sym, name, obj_idx, symtab, placed)?
+                    } else {
+                        0
+                    };
+                    entries.push((rela, name.as_str(), address));
+                }
+                let section_name = &obj.section_names[*target_sec_idx];
+                let value = evaluate_postfix_pm32(&entries, section_name, &obj.path)?;
+                let ps = placed
+                    .iter_mut()
+                    .find(|ps| ps.object_idx == obj_idx && ps.input_section_idx == *target_sec_idx)
+                    .unwrap();
+                let byte_offset = reloc_byte_offset(R_SHARC_PM32, offset, ps.qualifier);
+                if byte_offset
+                    .checked_add(6)
+                    .is_none_or(|end| end > ps.data.len())
+                {
+                    return Err(Error::Relocation(format!(
+                        "postfix PM32 at offset 0x{offset:x} exceeds `{section_name}` in `{}`",
+                        obj.path
+                    )));
+                }
+                patch_reloc(
+                    &mut ps.data,
+                    byte_offset,
+                    R_SHARC_PM32,
+                    value,
+                    RelocEffect::Write,
+                );
+                postfix_offsets.insert(offset);
+            }
             for rela in relas {
                 let sym_idx = (rela.r_info >> 8) as usize;
                 let rela_type = rela.r_info & 0xff;
 
-                if rela_type == R_SHARC_NONE {
+                if rela_type == R_SHARC_NONE || postfix_offsets.contains(&rela.r_offset) {
                     continue;
                 }
 
@@ -393,50 +552,8 @@ pub fn apply_relocations(
 
                 let (sym, sym_name) = &syms[sym_idx];
 
-                // Resolve the symbol's final address
-                let sym_final_addr = if sym.st_shndx == SHN_UNDEF {
-                    // Look up in global symtab, then find placed
-                    // section. Honour alias names so that a `_foo`
-                    // reference can bind to a `foo.` definition and
-                    // vice versa.
-                    let maybe_resolved = symtab.symbols.get(sym_name).or_else(|| {
-                        crate::resolve::name_aliases(sym_name)
-                            .into_iter()
-                            .find_map(|a| symtab.symbols.get(&a))
-                    });
-                    if let Some(resolved) = maybe_resolved {
-                        // ELF SHN_ABS (0xfff1) marks an absolute-value
-                        // symbol that has no defining section: its
-                        // `value` is already the final address. Used
-                        // by LDF script-evaluated constants such as
-                        // `ldf_stack_space`, `___ldf_pmcachesize`,
-                        // etc. Looking those up in the placed-section
-                        // table is a category error.
-                        if resolved.section_idx == 0xfff1 {
-                            resolved.value
-                        } else {
-                            find_symbol_address(
-                                resolved.object_idx,
-                                resolved.section_idx as usize,
-                                resolved.value,
-                                placed,
-                            )
-                            .ok_or_else(|| {
-                                Error::Relocation(format!(
-                                    "symbol `{sym_name}` resolved but no placed section found"
-                                ))
-                            })?
-                        }
-                    } else {
-                        return Err(Error::UnresolvedSymbol(sym_name.clone()));
-                    }
-                } else {
-                    // Defined in this object
-                    let sec_idx = sym.st_shndx as usize;
-                    find_symbol_address(obj_idx, sec_idx, sym.st_value, placed).ok_or_else(
-                        || Error::Relocation(format!("symbol `{sym_name}` section not placed")),
-                    )?
-                };
+                let sym_final_addr =
+                    resolve_relocation_symbol(sym, sym_name, obj_idx, symtab, placed)?;
 
                 // Find the placed section containing the relocation site
                 let site_ps_idx = placed.iter().position(|ps| {
@@ -454,11 +571,14 @@ pub fn apply_relocations(
 
                 // The PC address is the relocation site in PM space.
                 // For SW sections: address is BW, r_offset is in
-                // 16-bit parcels; convert (addr + offset*2) / 2.
+                // 16-bit parcels. Use the same L1/L2 alias mapping as
+                // the target symbol before adding the parcel offset.
                 // For PM48 and other sections: address is already in
                 // the native unit and r_offset is in those units.
                 let pc_addr = match placed[site_ps_idx].qualifier {
-                    SectionQualifier::Sw => (placed[site_ps_idx].address + rela.r_offset * 2) / 2,
+                    SectionQualifier::Sw => {
+                        sw_pm_address(placed[site_ps_idx].address) + rela.r_offset
+                    }
                     _ => placed[site_ps_idx].address + rela.r_offset,
                 };
                 let section_name = obj
@@ -795,6 +915,174 @@ mod tests {
         let result = apply_relocations(std::slice::from_ref(&obj), &symtab, &mut placed);
         assert!(result.is_ok());
         assert_eq!(placed[0].data, vec![0u8; 8]);
+    }
+
+    #[test]
+    fn l2_pc_branch_matches_vendor_pair_image() {
+        // stereo-routing-repair/dsp_pair/vendor06/pair_vendor.elfdump
+        // L1153: PM 0x00b8e012, 070000000015, `if eq jump
+        // (pc,_pair_protocol_new)`. The symbol is 0x00b8e027 (L320),
+        // and t58_acc.ldf L3 places code at BW 0x2001c000. The object
+        // carries PCREL24 at parcel 0x12 against symbol value 0x27.
+        // Dividing the L2 byte address by two instead of mapping its
+        // PM alias previously emitted 070000b80015.
+        let mut code = vec![0; 0x54];
+        code[0x24..0x2a].copy_from_slice(&[0x07, 0, 0, 0, 0, 0]);
+        let mut writer = selelf::elf_write::ElfWriter::new();
+        let section = writer.add_text_section_sw("seg_pair_code", &code);
+        writer.add_local("_pair_protocol_new", section, 0x27);
+        writer.add_relocation(
+            section,
+            0x12,
+            "_pair_protocol_new",
+            R_SHARC_PM_PCREL24 as u8,
+            0,
+        );
+        let object =
+            crate::resolve::load_object("pair_vendor_vector.doj", writer.finish()).unwrap();
+        let symbols = crate::resolve::resolve(std::slice::from_ref(&object)).unwrap();
+        // The same relative branch also retains the existing L1 result.
+        for address in [0x2001c000, 0x00380000] {
+            let mut placed = vec![PlacedSection {
+                output_name: "seg_pair_code".into(),
+                object_idx: 0,
+                input_section_idx: section as usize,
+                address,
+                size: code.len() as u32,
+                data: code.clone(),
+                is_nobits: false,
+                qualifier: SectionQualifier::Sw,
+                target_memory: "mem_pair_code".into(),
+            }];
+            apply_relocations(std::slice::from_ref(&object), &symbols, &mut placed).unwrap();
+            assert_eq!(&placed[0].data[0x24..0x2a], &[0x07, 0, 0, 0, 0, 0x15]);
+        }
+    }
+
+    #[test]
+    fn postfix_pm32_matches_vendor_addition_and_subtraction() {
+        // Parcel 0x11a: r2 = _mod_params + 4. The vendor object has
+        // e0(params), e1(constant,4), e2(operator), 0c(operator).
+        // The vendor image contains 0f02002df784, not the old 0f02002df77c.
+        // Parcel 0x56: return label - 1 uses e3,
+        // and links to 9fc00016f418. Both paths share the same evaluator.
+        let mut code = vec![0; 0x240];
+        code[0xac..0xb2].copy_from_slice(&[0x9f, 0xc0, 0, 0, 0, 0]);
+        code[0x234..0x23a].copy_from_slice(&[0x0f, 0x02, 0, 0, 0, 0]);
+        code[0x23a..].fill(0xaa);
+        for legacy_addition in [false, true] {
+            let mut writer = selelf::elf_write::ElfWriter::new();
+            let code_idx = writer.add_text_section_sw("seg_mod_code", &code);
+            let data_idx = writer.add_data_section("seg_mod_params", &[0; 4]);
+            writer.add_object("_mod_params", data_idx, 0, 4);
+            writer.add_local("_mod_setup_entry_done", code_idx, 0x59);
+            writer.add_local(SYM_OPERATOR, code_idx, 0x54);
+            writer.add_local(SYM_CONSTANT, code_idx, 0x54);
+            for (offset, symbol, value, operator) in [
+                (0x56, "_mod_setup_entry_done", 1, R_SHARC_PM_EXPR_MARKER),
+                (0x11a, "_mod_params", 4, R_SHARC_PM_EXPR_ADD),
+            ] {
+                if legacy_addition && offset == 0x11a {
+                    // Legacy selas e0 without a terminal keeps its
+                    // additive-field convention and the same result.
+                    writer.add_relocation(code_idx, offset, symbol, 0xe0, value);
+                    continue;
+                }
+                for (name, kind, addend) in [
+                    (symbol, R_SHARC_PM_SW_BRANCHRETURN, 0),
+                    (SYM_CONSTANT, R_SHARC_PM32_SUB, value),
+                    (SYM_OPERATOR, operator, 0),
+                    (SYM_OPERATOR, R_SHARC_PM32, 0),
+                ] {
+                    writer.add_relocation(code_idx, offset, name, kind as u8, addend);
+                }
+            }
+            let object =
+                crate::resolve::load_object("mod_vendor_vector.doj", writer.finish()).unwrap();
+            let symbols = crate::resolve::resolve(std::slice::from_ref(&object)).unwrap();
+            let mut placed: Vec<_> = [
+                (
+                    "seg_mod_code",
+                    code_idx,
+                    0x2de780,
+                    code.clone(),
+                    SectionQualifier::Sw,
+                ),
+                (
+                    "seg_mod_params",
+                    data_idx,
+                    0x2df780,
+                    vec![0; 4],
+                    SectionQualifier::Bw,
+                ),
+            ]
+            .into_iter()
+            .map(|(name, index, address, data, qualifier)| PlacedSection {
+                output_name: name.into(),
+                object_idx: 0,
+                input_section_idx: index as usize,
+                address,
+                size: data.len() as u32,
+                data,
+                is_nobits: false,
+                qualifier,
+                target_memory: "memory".into(),
+            })
+            .collect();
+            apply_relocations(&[object], &symbols, &mut placed).unwrap();
+            assert_eq!(
+                &placed[0].data[0xac..0xb2],
+                &[0x9f, 0xc0, 0, 0x16, 0xf4, 0x18]
+            );
+            assert_eq!(
+                &placed[0].data[0x234..0x23a],
+                &[0x0f, 0x02, 0, 0x2d, 0xf7, 0x84]
+            );
+            assert_eq!(&placed[0].data[0x23a..], &[0xaa; 6]);
+        }
+    }
+
+    #[test]
+    fn postfix_pm32_rejects_malformed_and_unproven_terminals() {
+        // Malformations of the +4 sequence above. A vendor
+        // object has a LOOP16 postfix terminal but no
+        // retained linked image to establish its relative semantics.
+        let entries: Vec<_> = [
+            (R_SHARC_PM_SW_BRANCHRETURN, "target", 0, 0x2df780),
+            (R_SHARC_PM32_SUB, SYM_CONSTANT, 4, 0),
+            (R_SHARC_PM_EXPR_ADD, SYM_OPERATOR, 0, 0),
+            (R_SHARC_PM32, SYM_OPERATOR, 0, 0),
+        ]
+        .into_iter()
+        .map(|(kind, name, addend, address)| {
+            (
+                Elf32Rela {
+                    r_offset: 0,
+                    r_info: kind,
+                    r_addend: addend,
+                },
+                name,
+                address,
+            )
+        })
+        .collect();
+        let refs: Vec<_> = entries.iter().map(|(r, n, a)| (r, *n, *a)).collect();
+        assert!(evaluate_postfix_pm32(&refs[..3], "code", "test").is_err());
+        assert!(evaluate_postfix_pm32(&refs[1..], "code", "test").is_err());
+        assert!(evaluate_postfix_pm32(&[refs[0], refs[1], refs[3]], "code", "test").is_err());
+        for kind in [R_SHARC_PM_LOOP16, 0xff] {
+            let unknown = Elf32Rela {
+                r_offset: 0,
+                r_info: kind,
+                r_addend: 0,
+            };
+            assert!(evaluate_postfix_pm32(
+                &[refs[0], refs[1], refs[2], (&unknown, SYM_OPERATOR, 0)],
+                "code",
+                "test"
+            )
+            .is_err());
+        }
     }
 
     #[test]

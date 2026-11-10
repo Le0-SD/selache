@@ -9,8 +9,8 @@
 
 use crate::error::{Error, Result};
 use selinstr::encode::{
-    AluOp, BranchTarget, ComputeOp, DagAccess, FaluOp, Instruction, LoopCounter, MemAccess,
-    MemWidth, MulOp, MultiOp, ShiftOp,
+    AluOp, BranchTarget, ComputeOp, DagAccess, DagWidth, FaluOp, Instruction, LoopCounter,
+    MemAccess, MemWidth, MulOp, MultiOp, ShiftOp,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,6 +37,13 @@ pub struct ParsedLine {
     /// libsel's startup.s uses it to seed `I7` with the top of the
     /// LDF-defined stack reserve.
     pub extra_label_refs: Vec<(String, i64)>,
+    /// Source line (1-based, after preprocessing). The reference assembler names the
+    /// label it generates for a numeric DO target after it
+    /// (`___ADI_AGL_DO_5`).
+    pub line: u32,
+    /// Labels the reference assembler generates at this instruction for numeric `(PC, n)`
+    /// targets (`___ADI_AGL_<KIND>_<line>`), beside any source label.
+    pub generated_labels: Vec<String>,
 }
 
 /// Assembler directive.
@@ -54,8 +61,9 @@ pub enum Directive {
     /// (libsel's startup.s relies on the comma form for the
     /// `ldf_stack_space, ldf_stack_length` pair defined by the LDF.)
     Extern(Vec<String>),
-    Var(String),
-    Byte(Vec<u8>),
+    /// `.VAR` (32-bit elements) or `.BYTE` (8-bit elements) data
+    /// declaration.
+    Data(DataDecl),
     Align(u32),
     Set(String, String),
     /// `.NOCOMPRESS;` — suppress VISA compression for following
@@ -69,6 +77,485 @@ pub enum Directive {
     /// `.COMPRESS;` — re-enable VISA compression after a
     /// `.NOCOMPRESS;` block.
     Compress,
+}
+
+/// One element initializer of a `.VAR` / `.BYTE` declaration.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DataInit {
+    /// Constant value, already range-checked for the element width.
+    Num(i64),
+    /// Absolute address of a symbol, patched by the linker. Only
+    /// 32-bit (`.VAR`) elements can hold one.
+    Sym(String),
+}
+
+/// A `.VAR` / `.BYTE` declaration laid out the way the reference assembler does
+/// (measured on two test modules): `name` is a
+/// scalar of one element, `name[N]` an array of N elements, `name[]` an
+/// array sized by its initializer list. Without initializers the
+/// elements are zero. `name` is empty for selcc's bare `.VAR = v;`
+/// continuation word.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataDecl {
+    pub name: String,
+    /// Element size in bytes: 4 for `.VAR`, 1 for `.BYTE`.
+    pub width: usize,
+    /// Number of elements.
+    pub len: usize,
+    /// Either empty (zero-filled) or exactly `len` entries.
+    pub inits: Vec<DataInit>,
+}
+
+/// Parse the body of a `.VAR` (`width` 4) or `.BYTE` (`width` 1)
+/// directive. Forms whose the reference assembler layout is not pinned by a vendor
+/// object are rejected rather than guessed: several declarations in one
+/// directive, a sized array with a short initializer list holding a
+/// non-zero value, file or string initializers, and values that do not
+/// fit the element.
+fn parse_data_decl(body: &str, width: usize) -> std::result::Result<DataDecl, String> {
+    let s = body.replace('\t', " ");
+    let s = s.trim().trim_end_matches(';').trim();
+    let (lhs, rhs) = match s.split_once('=') {
+        Some((l, r)) => (l.trim(), Some(r.trim())),
+        None => (s, None),
+    };
+    if lhs.contains(',') {
+        return Err(format!(
+            "one declaration per data directive is supported, got `{lhs}`"
+        ));
+    }
+    // `None` = scalar, `Some(None)` = `name[]`, `Some(Some(n))` = `name[n]`.
+    let (name, size) = match lhs.find('[') {
+        Some(open) => {
+            let close = lhs
+                .rfind(']')
+                .filter(|&c| c > open && lhs[c + 1..].trim().is_empty())
+                .ok_or_else(|| format!("malformed array declaration `{lhs}`"))?;
+            let n = lhs[open + 1..close].trim();
+            let size = if n.is_empty() {
+                None
+            } else {
+                let v = eval_const_expr(n)
+                    .filter(|&v| v > 0 && v <= i64::from(u32::MAX))
+                    .ok_or_else(|| format!("invalid array length `{n}`"))?;
+                Some(v as usize)
+            };
+            (lhs[..open].trim(), Some(size))
+        }
+        None => (lhs, None),
+    };
+    if !name.is_empty() && !is_valid_label(name) {
+        return Err(format!("invalid data symbol name `{name}`"));
+    }
+    let mut inits = match rhs {
+        None => Vec::new(),
+        Some(r) => {
+            let mut out = Vec::new();
+            let mut prev = 0;
+            let mut cuts = find_all_commas_outside_parens(r);
+            cuts.push(r.len());
+            for c in cuts {
+                out.push(parse_data_init(&r[prev..c], width)?);
+                prev = c + 1;
+            }
+            out
+        }
+    };
+    let len = match size {
+        None => {
+            if name.is_empty() && inits.is_empty() {
+                return Err("data directive needs a name or an initializer".into());
+            }
+            if inits.len() > 1 {
+                return Err(format!(
+                    "scalar `{name}` has {} initializers; declare it as `{name}[]`",
+                    inits.len()
+                ));
+            }
+            1
+        }
+        Some(None) => {
+            if inits.is_empty() {
+                return Err(format!("`{name}[]` needs an initializer list"));
+            }
+            inits.len()
+        }
+        Some(Some(n)) => {
+            // The reference assembler accepts a short list: a module's
+            // `.byte storage.[9492] = 0;` gives 9492
+            // zero bytes. Only an all-zero short list is pinned by a
+            // vendor object; any other short list is rejected.
+            let all_zero = inits.iter().all(|i| *i == DataInit::Num(0));
+            if inits.len() < n && all_zero {
+                inits.clear();
+            } else if !inits.is_empty() && inits.len() != n {
+                return Err(format!(
+                    "`{name}[{n}]` has {} initializers; list all {n}, none, or only zeros",
+                    inits.len()
+                ));
+            }
+            n
+        }
+    };
+    Ok(DataDecl {
+        name: name.to_string(),
+        width,
+        len,
+        inits,
+    })
+}
+
+/// Element width of a `.VAR` (4) or `.BYTE` (1) directive keyword at
+/// the start of `upper`; `None` for anything else, including `.BYTE2`,
+/// `.BYTE4` and qualified `.VAR/...` forms.
+fn data_directive_width(upper: &str) -> Option<usize> {
+    let ends_keyword = |rest: &str| rest.is_empty() || rest.starts_with([' ', '\t', ';', '=']);
+    if upper.strip_prefix(".VAR").is_some_and(ends_keyword) {
+        Some(4)
+    } else if upper.strip_prefix(".BYTE").is_some_and(ends_keyword) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Number of comma-separated parallel operations in an instruction's text
+/// (`else` prefixes dropped, commas inside parentheses ignored).
+fn parallel_operations(text: &str) -> usize {
+    let mut depth = 0i32;
+    let mut count = 0;
+    let mut current = String::new();
+    // A bare condition (`IF EQ`, `IF NOT AC`) is not an operation: the
+    // disassembler prints an empty compute slot as `IF EQ  , DM(...)`.
+    let flush = |current: &mut String, count: &mut usize| {
+        let words: Vec<&str> = current.split_whitespace().collect();
+        let bare_condition = words.first().is_some_and(|w| w.eq_ignore_ascii_case("IF"))
+            && (words.len() == 2 || (words.len() == 3 && words[1].eq_ignore_ascii_case("NOT")));
+        if !words.is_empty() && !bare_condition {
+            *count += 1;
+        }
+        current.clear();
+    };
+    for ch in text.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                flush(&mut current, &mut count);
+                continue;
+            }
+            _ => {}
+        }
+        current.push(ch);
+    }
+    flush(&mut current, &mut count);
+    count
+}
+
+/// DM addresses come from DAG1 (I0-I7, M0-M7) and PM addresses from DAG2
+/// (I8-I15, M8-M15). Of 46,543 `DM|PM(...)` operands the reference
+/// assembler accepts, none mixes them; it rejects all
+/// 2,152 that do. selas folded the index into the 3-bit field, so
+/// `astatx = dm(-0x75, i14)` accessed through I6.
+fn check_dag_registers(text: &str, line: u32) -> Result<()> {
+    let upper = text.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    let mut at = 0;
+    while let Some(found) = upper[at..].find("M") {
+        let k = at + found;
+        at = k + 1;
+        if k == 0 || !matches!(bytes[k - 1], b'D' | b'P') {
+            continue;
+        }
+        let start = k - 1;
+        if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+            continue;
+        }
+        let pm = bytes[start] == b'P';
+        let rest = upper[k + 1..].trim_start();
+        if !rest.starts_with('(') {
+            continue;
+        }
+        let open = upper.len() - rest.len();
+        let Some(close) = find_matching_close_paren(&upper, open) else {
+            continue;
+        };
+        for operand in upper[open + 1..close].split(',') {
+            let operand = operand.trim();
+            let Some(kind @ (b'I' | b'M')) = operand.bytes().next() else {
+                continue;
+            };
+            let Ok(n) = operand[1..].parse::<u8>() else {
+                continue;
+            };
+            if n < 16 && (n >= 8) != pm {
+                return Err(Error::Parse {
+                    line,
+                    msg: format!(
+                        "{}{n} is not a {} register: {}",
+                        kind as char,
+                        if pm { "PM (DAG2)" } else { "DM (DAG1)" },
+                        text.trim()
+                    ),
+                });
+            }
+        }
+    }
+    // `MODIFY(Ii, Mm)`: I and M from one DAG. Type 7 holds 3-bit fields
+    // and a DAG bit, so `i0 = modify(i2, m11)` modified I2 by M3; the reference assembler
+    // rejects every such row (`modify(i0, m10)`, `r10 = r10 + r14 , i5 =
+    // modify ( i5 , m12 )`).
+    let mut at = 0;
+    while let Some(found) = upper[at..].find("MODIFY") {
+        let k = at + found;
+        at = k + 6;
+        let rest = upper[at..].trim_start();
+        if !rest.starts_with('(') {
+            continue;
+        }
+        let open = upper.len() - rest.len();
+        let Some(close) = find_matching_close_paren(&upper, open) else {
+            continue;
+        };
+        let dags: Vec<(char, u8)> = upper[open + 1..close]
+            .split(',')
+            .filter_map(|op| {
+                let op = op.trim();
+                let kind = op.chars().next()?;
+                let n = op.get(1..)?.parse::<u8>().ok()?;
+                (matches!(kind, 'I' | 'M') && n < 16).then_some((kind, n))
+            })
+            .collect();
+        if let [(_, a), (_, b)] = dags[..] {
+            if (a >= 8) != (b >= 8) {
+                return Err(Error::Parse {
+                    line,
+                    msg: format!("MODIFY mixes DAG1 and DAG2 registers: {}", text.trim()),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An I or M register of the DAG doing the access moves only as a
+/// pre-modify load (`i3 = dm(m0, i0)`, `m0 = dm(m7, i2)`: 22 the reference assembler rows,
+/// all accepted). The reference assembler rejects every post-modify form and every store
+/// (`i1 = dm(i0, m0)`, `dm(m7, i2) = m4`, `i10 = pm(i8, m8)`: 82 rows, all
+/// rejected). No vendor rows cover L or B.
+fn check_dag_self_transfer(instr: &Instruction, line: u32) -> Result<()> {
+    if let Instruction::UregDagMove {
+        pm,
+        write,
+        ureg,
+        post_modify,
+        ..
+    } = *instr
+    {
+        let dag_register = matches!(ureg >> 4, 1 | 2) && ((ureg & 0xF) >= 8) == pm;
+        if dag_register && (write || post_modify) {
+            return Err(Error::Parse {
+                line,
+                msg: format!(
+                    "{} cannot be {} through its own DAG{}",
+                    selinstr::disasm::ureg_display_name(ureg),
+                    if write { "stored" } else { "loaded" },
+                    if write { "" } else { " with post-modify" }
+                ),
+            });
+        }
+    }
+    // Type 15 (`DM|PM(offset, Ii)`): storing an I/M/L/B register of the
+    // access's own DAG is rejected (16 of 16 rows, e.g. `dm ( -0x21 , i6 )
+    // = b4`, `pm ( 0x10 , i12 ) = b8`); loads are accepted (1,111 rows).
+    if let Instruction::UregMemAccess {
+        pm,
+        write: true,
+        ureg,
+        ..
+    } = *instr
+    {
+        if matches!(ureg >> 4, 1..=4) && ((ureg & 0xF) >= 8) == pm {
+            return Err(Error::Parse {
+                line,
+                msg: format!(
+                    "{} cannot be stored through its own DAG",
+                    selinstr::disasm::ureg_display_name(ureg)
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Refuse parallel operations that write one data register twice
+/// (`r0 = r0 - 1, r0 = dm(i0, 0)`, `f0 = -f2, r0 = dm(-5, i4)`). None of the
+/// 101,833 instructions the reference assembler accepts
+/// does; it rejects all 1,819 that do. selas encoded them, leaving the
+/// result to whichever write the hardware lets win.
+fn check_no_double_write(text: &str, line: u32) -> Result<()> {
+    let mut written = [false; 16];
+    let mut depth = 0i32;
+    let mut part = String::new();
+    let mut check = |part: &str| -> Result<()> {
+        let mut words = part.trim();
+        // Skip `IF [NOT] cond` and `ELSE` prefixes.
+        if words.len() > 3 && words[..3].eq_ignore_ascii_case("IF ") {
+            let rest = words[3..].trim_start();
+            let rest = if rest.len() > 4 && rest[..4].eq_ignore_ascii_case("NOT ") {
+                rest[4..].trim_start()
+            } else {
+                rest
+            };
+            words = rest.split_once(' ').map_or("", |(_, r)| r).trim_start();
+        }
+        if words.len() > 5 && words[..5].eq_ignore_ascii_case("ELSE ") {
+            words = words[5..].trim_start();
+        }
+        // `Rn <-> Sn` writes Rn too: the reference assembler rejects `f0 = scalb f0 by r4 ,
+        // r0 < - > s5` and takes `f0 = scalb f2 by r4 , r4 < - > s5`.
+        let packed: String = words.chars().filter(|c| !c.is_whitespace()).collect();
+        let lhs = if let Some((lhs, _)) = packed.split_once("<->") {
+            lhs
+        } else {
+            let Some((lhs, rhs)) = words.split_once('=') else {
+                return Ok(());
+            };
+            if rhs.starts_with('=') {
+                return Ok(());
+            }
+            lhs.trim()
+        };
+        // FADDR and DADDR are read-only: the reference assembler rejects `faddr = r5` and
+        // `daddr = r5` and takes `r5 = daddr` = 763e82bf.
+        if lhs.eq_ignore_ascii_case("FADDR") || lhs.eq_ignore_ascii_case("DADDR") {
+            return Err(Error::Parse {
+                line,
+                msg: format!("{lhs} is read-only: {text}"),
+            });
+        }
+        let index = match lhs.as_bytes().first() {
+            Some(b'R' | b'r' | b'F' | b'f') => lhs[1..].parse::<usize>().ok(),
+            _ => None,
+        };
+        // An (LW) load writes the pair Rn, Rn^1: the reference assembler rejects `r15 =
+        // pass r9 , r14 = dm ( i3 , m2 ) ( lw )` and `r0 = pass r9 , r1 =
+        // dm ( i3 , m2 ) ( lw )`.
+        let upper = packed.to_ascii_uppercase();
+        let lw_load = upper.ends_with("(LW)")
+            && upper
+                .split_once('=')
+                .is_some_and(|(_, rhs)| rhs.starts_with("DM(") || rhs.starts_with("PM("));
+        if let Some(n) = index.filter(|&n| n < 16) {
+            let pair = if lw_load { Some(n ^ 1) } else { None };
+            for r in std::iter::once(n).chain(pair) {
+                if std::mem::replace(&mut written[r], true) {
+                    return Err(Error::Parse {
+                        line,
+                        msg: format!("R{r}/F{r} is written twice in one instruction: {text}"),
+                    });
+                }
+            }
+        }
+        Ok(())
+    };
+    for ch in text.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                check(&part)?;
+                part.clear();
+                continue;
+            }
+            _ => {}
+        }
+        part.push(ch);
+    }
+    check(&part)
+}
+
+/// Refuse an instruction whose encoding, decoded again, holds a different
+/// number of parallel operations than its source: the parser recognised one
+/// part and silently discarded the rest, or picked a form that adds an
+/// operation (`f15 = f9 + f15, f9 = f9 - f15, r8 = r0` became a multiply +
+/// dual add/sub that also wrote F0). The reference assembler
+/// found 2,321 such rows, e.g.
+/// `jump (m12, i12), r4 = r1 + r2` encoded as the bare jump and
+/// `f0 = f3 * f4, f8 = max(f8, f14), dm(i5, m4) = r1` without the MAX.
+fn check_no_dropped_operations(text: &str, instr: &Instruction, line: u32) -> Result<()> {
+    let Ok(bytes) = selinstr::encode::encode(instr) else {
+        return Ok(());
+    };
+    let word = bytes.iter().fold(0u64, |w, &b| (w << 8) | u64::from(b));
+    let decoded = selinstr::disasm::decode_instruction(word);
+    let (wanted, got) = (parallel_operations(text), parallel_operations(&decoded));
+    if got != wanted {
+        return Err(Error::Parse {
+            line,
+            msg: format!(
+                "`{text}` is not supported as written: it would encode as `{decoded}` \
+                 ({got} parallel operations instead of {wanted})"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// `text` without a leading `label:`.
+fn strip_label(text: &str) -> &str {
+    match text.find(':') {
+        Some(pos) if is_valid_label(text[..pos].trim()) => text[pos + 1..].trim_start(),
+        _ => text,
+    }
+}
+
+/// `F0`..`F15`: a float register name.
+fn is_float_reg(name: &str) -> bool {
+    let upper = name.trim().to_uppercase();
+    upper.len() > 1 && upper.starts_with('F') && upper[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// `Fn = Fm` has no vendor vector: the reference assembler encodes `Rn = Rm` as a Type 5
+/// transfer (703e07bf), and `Fn = PASS Fm` is a float ALU operation.
+fn float_copy_error(lhs: &str, rhs: &str, line: u32) -> Error {
+    Error::Parse {
+        line,
+        msg: format!(
+            "`{lhs} = {rhs}`: write `{lhs} = PASS {rhs}` or use R registers for a plain transfer"
+        ),
+    }
+}
+
+/// True for a line that starts a `.VAR` / `.BYTE` statement.
+fn is_data_directive(trimmed: &str) -> bool {
+    let upper = trimmed.to_uppercase();
+    data_directive_width(&upper).is_some()
+}
+
+/// Parse one initializer: a constant expression that fits the element,
+/// or (32-bit elements only) a bare symbol name.
+fn parse_data_init(item: &str, width: usize) -> std::result::Result<DataInit, String> {
+    let t = item.trim();
+    if t.is_empty() {
+        return Err("empty initializer in data list".into());
+    }
+    if let Some(v) = eval_const_expr(t) {
+        let (lo, hi) = match width {
+            1 => (-0x80, 0xff),
+            _ => (-0x8000_0000, 0xffff_ffff),
+        };
+        if v < lo || v > hi {
+            return Err(format!(
+                "initializer `{t}` = {v} does not fit a {width}-byte element"
+            ));
+        }
+        return Ok(DataInit::Num(v));
+    }
+    if width == 4 && is_valid_label(t) {
+        return Ok(DataInit::Sym(t.to_string()));
+    }
+    Err(format!("unsupported data initializer `{t}`"))
 }
 
 // ---------------------------------------------------------------------------
@@ -87,7 +574,9 @@ impl<'a> AsmParser<'a> {
 
     pub fn parse_all(&mut self) -> Result<Vec<ParsedLine>> {
         let mut results = Vec::new();
-        let mut in_var_init = false;
+        // A `.VAR` / `.BYTE` statement whose initializer list spans
+        // several lines, collected up to its terminating `;`.
+        let mut data_stmt: Option<String> = None;
         let mut struct_depth: u32 = 0;
         let mut pending_line = String::new();
         let lines: Vec<&str> = self.src.lines().collect();
@@ -96,12 +585,28 @@ impl<'a> AsmParser<'a> {
             let raw_line = lines[i];
             self.line += 1;
             i += 1;
-            // Skip continuation lines of multi-line .VAR array initializers
-            if in_var_init {
-                let trimmed = strip_comment(raw_line).trim();
-                if trimmed.ends_with(';') {
-                    in_var_init = false;
+            // `#line N "file"` from the preprocessor: the next line is N.
+            // Counting the marker itself put every line number one high
+            // (and off by the include's length after an `#include`).
+            if let Some(rest) = raw_line.trim_start().strip_prefix("#line ") {
+                if let Some(n) = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse::<u32>().ok())
+                {
+                    self.line = n.saturating_sub(1);
+                    continue;
                 }
+            }
+            if let Some(stmt) = data_stmt.as_mut() {
+                let trimmed = strip_comment(raw_line).trim();
+                stmt.push(' ');
+                stmt.push_str(trimmed);
+                if !trimmed.contains(';') {
+                    continue;
+                }
+                let text = data_stmt.take().unwrap_or_default();
+                results.push(self.parse_line(&text)?);
                 continue;
             }
             // Skip .STRUCT body lines (brace-delimited)
@@ -121,6 +626,13 @@ impl<'a> AsmParser<'a> {
             // they are symbol-list directives (.GLOBAL, .EXTERN, .WEAK) or
             // the pending buffer already holds a partial directive.
             let trimmed = strip_comment(raw_line).trim();
+            if pending_line.is_empty()
+                && is_data_directive(strip_label(trimmed))
+                && !trimmed.contains(';')
+            {
+                data_stmt = Some(trimmed.to_string());
+                continue;
+            }
             let allow_dot_join = {
                 let u = trimmed.to_uppercase();
                 u.starts_with(".GLOBAL") || u.starts_with(".EXTERN") || u.starts_with(".WEAK")
@@ -212,12 +724,6 @@ impl<'a> AsmParser<'a> {
                 }
                 Err(e) => return Err(e),
             };
-            // Detect start of multi-line .VAR: has '=' but no ';' terminator
-            if let Some(Directive::Var(ref body)) = parsed.directive {
-                if body.contains('=') && !raw_line.contains(';') {
-                    in_var_init = true;
-                }
-            }
             // Detect start of .STRUCT body (brace-delimited block)
             {
                 let trimmed_upper = strip_comment(&effective_line).trim().to_uppercase();
@@ -238,6 +744,12 @@ impl<'a> AsmParser<'a> {
                 results.push(parsed);
             }
         }
+        if data_stmt.is_some() {
+            return Err(Error::Parse {
+                line: self.line,
+                msg: "unterminated .VAR/.BYTE statement (missing `;`)".into(),
+            });
+        }
         Ok(results)
     }
 
@@ -256,6 +768,8 @@ impl<'a> AsmParser<'a> {
                 directive: None,
                 label_ref: None,
                 extra_label_refs: Vec::new(),
+                line: self.line,
+                generated_labels: Vec::new(),
             });
         }
         if line.is_empty() {
@@ -265,6 +779,8 @@ impl<'a> AsmParser<'a> {
                 directive: None,
                 label_ref: None,
                 extra_label_refs: Vec::new(),
+                line: self.line,
+                generated_labels: Vec::new(),
             });
         }
 
@@ -293,6 +809,8 @@ impl<'a> AsmParser<'a> {
                 directive: None,
                 label_ref: None,
                 extra_label_refs: Vec::new(),
+                line: self.line,
+                generated_labels: Vec::new(),
             });
         }
 
@@ -305,17 +823,25 @@ impl<'a> AsmParser<'a> {
                 directive: Some(directive),
                 label_ref: None,
                 extra_label_refs: Vec::new(),
+                line: self.line,
+                generated_labels: Vec::new(),
             });
         }
 
         // Parse instruction
         let (instr, label_ref, extra_label_refs) = parse_instruction_at_line(rest, self.line)?;
+        check_no_dropped_operations(rest, &instr, self.line)?;
+        check_no_double_write(rest, self.line)?;
+        check_dag_registers(rest, self.line)?;
+        check_dag_self_transfer(&instr, self.line)?;
         Ok(ParsedLine {
             label,
             instruction: Some(instr),
             directive: None,
             label_ref,
             extra_label_refs,
+            line: self.line,
+            generated_labels: Vec::new(),
         })
     }
 
@@ -345,10 +871,20 @@ impl<'a> AsmParser<'a> {
             let names = parse_symbol_list(rest);
             return Ok(Directive::Extern(names));
         }
-        if upper.starts_with(".VAR") {
-            let rest = &text[4..];
-            let name = rest.trim().trim_end_matches(';').trim().to_string();
-            return Ok(Directive::Var(name));
+        if let Some(width) = data_directive_width(&upper) {
+            let keyword_len = if width == 4 { 4 } else { 5 };
+            let decl =
+                parse_data_decl(&text[keyword_len..], width).map_err(|msg| Error::Parse {
+                    line: self.line,
+                    msg,
+                })?;
+            return Ok(Directive::Data(decl));
+        }
+        if upper.starts_with(".BYTE") || upper.starts_with(".VAR/") {
+            return Err(Error::Parse {
+                line: self.line,
+                msg: format!("unsupported data directive: {text}"),
+            });
         }
         if let Some(rest) = upper.strip_prefix(".ALIGN") {
             let val_str = rest.trim().trim_end_matches(';').trim();
@@ -357,9 +893,6 @@ impl<'a> AsmParser<'a> {
                 msg: format!("invalid .ALIGN value: {val_str}"),
             })?;
             return Ok(Directive::Align(val));
-        }
-        if upper.starts_with(".BYTE") {
-            return Ok(Directive::Byte(Vec::new()));
         }
         if upper.starts_with(".NOCOMPRESS") {
             return Ok(Directive::NoCompress);
@@ -405,6 +938,35 @@ pub fn parse_instruction(text: &str) -> Result<Instruction> {
 }
 
 #[allow(clippy::type_complexity)]
+/// Rewrite `<` `-` `>` separated by whitespace as `<->`.
+fn collapse_swap_arrow(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '<' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == '-' {
+                let mut k = j + 1;
+                while k < chars.len() && chars[k].is_whitespace() {
+                    k += 1;
+                }
+                if k < chars.len() && chars[k] == '>' {
+                    out.push_str("<->");
+                    i = k + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 fn parse_instruction_at_line(
     text: &str,
     line: u32,
@@ -416,8 +978,11 @@ fn parse_instruction_at_line(
     } else {
         text
     };
+    // The reference assembler accepts the swap arrow spaced (`r5 < - > s5`, 139 rows); the
+    // parser only knew `<->` and dropped the swap.
+    let text = collapse_swap_arrow(text);
     // Normalize spacing: insert spaces around +/- between register operands
-    let normalized = normalize_compute_spacing(text);
+    let normalized = normalize_compute_spacing(&text);
     let (instr, label_ref, extra) = parse_instruction_inner_with_extra(&normalized, line)?;
     // The inner parser works on upper-cased text, so label names lose their
     // original case. Recover it from the un-modified source.
@@ -443,6 +1008,30 @@ fn parse_instruction_inner_with_extra(
     normalized: &str,
     line: u32,
 ) -> Result<(Instruction, Option<String>, Vec<(String, i64)>)> {
+    // `(PC, _e - _t)` is a linker expression,
+    // not a symbol whose name contains a minus. Keep the operands separate
+    // so the assembler can emit the vendor's postfix relocation sequence.
+    let upper = normalized.to_uppercase();
+    if upper.starts_with("DO ") || upper.starts_with("LCNTR") {
+        if let Some(do_at) = upper.find("DO") {
+            let target = upper[do_at + 2..].trim_start();
+            if let Some(inner) = target.strip_prefix('(').and_then(|s| s.split_once(')')) {
+                if let Some((pc, expr)) = inner.0.split_once(',') {
+                    if pc.trim() == "PC" {
+                        if let Some((a, b)) = expr.split_once('-') {
+                            let (a, b) = (a.trim(), b.trim());
+                            if is_valid_label(a) && is_valid_label(b) {
+                                let rewritten =
+                                    format!("{} (PC, {a}){}", &upper[..do_at + 2], inner.1);
+                                let (instr, label_ref) = parse_instruction_inner(&rewritten, line)?;
+                                return Ok((instr, label_ref, vec![(b.to_string(), -1)]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     let (instr, label_ref) = parse_instruction_inner(normalized, line)?;
     // Only LoadImm with a label_ref is a candidate for multi-symbol
     // expansion: the SHARC+ Tools dialect lets `ureg = symA + symB`
@@ -647,8 +1236,16 @@ fn parse_instruction_inner(normalized: &str, line: u32) -> Result<(Instruction, 
     // Ii=MODIFY (Ii, Mm)(NW) or Ii=BITREV (Ii, data32) — enhanced Type 7/19
     // Match when "=MODIFY" or "=BITREV" appears
     // Also handles compound: "compute , I7=MODIFY (I7,M6)(NW)"
-    if upper.contains("=MODIFY") || upper.contains("=BITREV") {
+    let compact: String = upper.chars().filter(|c| !c.is_whitespace()).collect();
+    if !upper.starts_with("IF ") && (compact.contains("=B2W(") || compact.contains("=W2B(")) {
+        return Ok((parse_dag_convert(&upper, 31, line)?, None));
+    }
+    if !upper.starts_with("IF ") && (compact.contains("=MODIFY(") || compact.contains("=BITREV(")) {
         let instr = parse_modify_assign(&upper, line)?;
+        return Ok((instr, None));
+    }
+
+    if let Some(instr) = try_parse_bit_fifo(&upper, line)? {
         return Ok((instr, None));
     }
 
@@ -702,6 +1299,8 @@ fn parse_instruction_inner(normalized: &str, line: u32) -> Result<(Instruction, 
                     i_reg,
                     m_reg,
                     cond,
+                    dest_xor,
+                    width,
                     ..
                 } = modify
                 {
@@ -712,6 +1311,8 @@ fn parse_instruction_inner(normalized: &str, line: u32) -> Result<(Instruction, 
                             m_reg,
                             cond,
                             compute: Some(compute),
+                            dest_xor,
+                            width,
                         },
                         None,
                     ));
@@ -771,34 +1372,18 @@ fn parse_instruction_inner(normalized: &str, line: u32) -> Result<(Instruction, 
         let lhs = upper[..eq].trim();
         let rhs = upper[eq + 1..].trim();
         if let Some(ureg) = ureg_code(lhs) {
-            if !rhs.is_empty()
-                && (rhs.starts_with('_')
-                    || rhs.starts_with('.')
-                    || rhs.as_bytes()[0].is_ascii_alphabetic())
-                && !rhs.contains(' ')
-                && !rhs.contains('*')
-                && !rhs.contains('+')
-                && !rhs.contains('-')
-                && !rhs.contains('(')
-                && ureg_code(rhs).is_none()
-                && is_label_token(rhs)
-            {
+            // ureg = label [+ label ...] [± constants]: the constants become
+            // the relocation addend. They used to be dropped, so
+            // `r0 = _mod_param + 16` loaded `_mod_param`; label differences
+            // loaded the first label and `r0 = b2w(i7)` a symbol "B2W".
+            if !rhs.is_empty() && ureg_code(rhs).is_none() && is_symbolic_expression(rhs) {
+                let (label, addend) = parse_label_load(rhs, line)?;
                 return Ok((
-                    Instruction::LoadImm { ureg, value: 0 },
-                    Some(rhs.to_string()),
-                ));
-            }
-
-            // ureg = label_expr — load immediate with label arithmetic
-            // Handles: "R0 = (label1 - label2)", "R0 = label - 1", etc.
-            // Detect by checking if the expression contains identifiers that
-            // are not register names (labels start with '.', '_', or alpha
-            // and are not in the ureg table).
-            if !rhs.is_empty() && has_label_ident(rhs) {
-                let first_label = extract_first_label(rhs);
-                return Ok((
-                    Instruction::LoadImm { ureg, value: 0 },
-                    first_label.map(|l| l.to_string()),
+                    Instruction::LoadImm {
+                        ureg,
+                        value: addend as i32 as u32,
+                    },
+                    Some(label),
                 ));
             }
         }
@@ -826,10 +1411,11 @@ fn is_label_token(tok: &str) -> bool {
     if tok.parse::<u64>().is_ok() || tok.starts_with("0X") {
         return false;
     }
-    // Not a compute mnemonic or keyword
+    // Not a compute mnemonic or keyword (the reference assembler rejects `r5 = emuidle`)
     !matches!(
         tok,
-        "ABS"
+        "EMUIDLE"
+            | "ABS"
             | "PASS"
             | "LSHIFT"
             | "ASHIFT"
@@ -892,7 +1478,6 @@ fn is_label_token(tok: &str) -> bool {
             | "BW"
             | "SW"
             | "NW"
-            | "SE"
     )
 }
 
@@ -900,6 +1485,89 @@ fn is_label_token(tok: &str) -> bool {
 /// (starts with '.', '_', or alpha) that is not a known register name.
 fn has_label_ident(expr: &str) -> bool {
     split_identifiers(expr).any(is_label_token)
+}
+
+/// True when every identifier in `rhs` is a label or a number (no register
+/// or mnemonic) and at least one is a label: `_mod_param + 16`,
+/// `_MOD2_PARAMS + 3 * 16 * 0`. Anything else is a compute.
+fn is_symbolic_expression(rhs: &str) -> bool {
+    let mut any_label = false;
+    for tok in split_identifiers(rhs) {
+        if parse_signed_number(tok).is_some() {
+            continue;
+        }
+        if !is_label_token(tok) {
+            return false;
+        }
+        any_label = true;
+    }
+    any_label
+}
+
+/// Parse the right-hand side of `ureg = <symbolic expression>`: terms
+/// joined by `+`/`-`, each a label or a constant expression. Returns the
+/// first label and the constant sum (the relocation addend); further labels
+/// are picked up by `extract_extra_label_addends`. A subtracted label, a
+/// constant next to several labels, or a term mixing a label with other
+/// arithmetic is rejected.
+fn parse_label_load(rhs: &str, line: u32) -> Result<(String, i64)> {
+    let err = |what: &str| Error::Parse {
+        line,
+        msg: format!("unsupported symbolic expression `{rhs}`: {what}"),
+    };
+    let mut expr = rhs.trim();
+    while let Some(inner) = expr.strip_prefix('(').and_then(|e| e.strip_suffix(')')) {
+        expr = inner.trim();
+    }
+    // Split into top-level terms with their signs.
+    let mut terms: Vec<(i64, String)> = Vec::new();
+    let mut current = String::new();
+    let mut sign = 1i64;
+    let mut depth = 0i32;
+    for ch in expr.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '+' | '-' if depth == 0 => {
+                if current.trim().is_empty() {
+                    if ch == '-' {
+                        sign = -sign;
+                    }
+                } else {
+                    terms.push((sign, std::mem::take(&mut current)));
+                    sign = if ch == '-' { -1 } else { 1 };
+                }
+                continue;
+            }
+            _ => {}
+        }
+        current.push(ch);
+    }
+    if !current.trim().is_empty() {
+        terms.push((sign, current));
+    }
+    let mut labels: Vec<String> = Vec::new();
+    let mut constant: i64 = 0;
+    for (sign, term) in terms {
+        let term = term.trim();
+        if is_label_token(term) {
+            if sign < 0 {
+                return Err(err("a subtracted label is not supported"));
+            }
+            labels.push(term.to_string());
+        } else if let Some(v) = eval_const_expr(term) {
+            constant += sign * v;
+        } else {
+            return Err(err(&format!("`{term}` is neither a label nor a constant")));
+        }
+    }
+    let Some(first) = labels.first().cloned() else {
+        return Err(err("no label"));
+    };
+    if labels.len() > 1 && constant != 0 {
+        return Err(err("a constant next to several labels is not supported"));
+    }
+    Ok((first, constant))
 }
 
 /// Check if an expression is `label-N` or `label+N`.
@@ -923,11 +1591,6 @@ fn split_label_addend(expr: &str) -> Option<(&str, i64)> {
         }
     }
     None
-}
-
-/// Extract the first label-like identifier from an expression.
-fn extract_first_label(expr: &str) -> Option<&str> {
-    split_identifiers(expr).find(|tok| is_label_token(tok))
 }
 
 /// Split a string into identifier-like tokens (alphanumeric, '_', '.').
@@ -1071,23 +1734,70 @@ fn parse_branch(text: &str, line: u32) -> Result<(Instruction, Option<String>)> 
     let call = text.starts_with("CALL");
     let rest = text[4..].trim();
 
-    // Indirect branch via register pair: JUMP (Mm,In) or JUMP (Mm, In) (DB)
+    // Indirect branch through a DAG2 pair:
+    //   JUMP|CALL (Mm, Ii) [(DB)] [, [ELSE] compute]
+    // Everything after the register pair must be consumed: `( db )` with
+    // spaces used to be missed, and a trailing compute silently dropped.
     if rest.starts_with('(') && !rest.starts_with("(PC") {
         if let Some(close) = rest.find(')') {
             let inner = rest[1..close].trim();
             let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
             if parts.len() == 2 {
-                let p0 = parts[0];
-                let p1 = parts[1];
-                let (m_str, i_str) = if p0.starts_with('M') {
-                    (p0, p1)
+                let (m_str, i_str) = if parts[0].starts_with('M') {
+                    (parts[0], parts[1])
                 } else {
-                    (p1, p0)
+                    (parts[1], parts[0])
                 };
                 if let (Some(m_code), Some(i_code)) = (ureg_code(m_str), ureg_code(i_str)) {
-                    // Check for (DB) after the closing paren
-                    let after = rest[close + 1..].trim();
-                    let delayed = after.starts_with("(DB)");
+                    let dag2 = |name: &str, prefix: char| {
+                        name.strip_prefix(prefix)
+                            .and_then(|n| n.parse::<u8>().ok())
+                            .filter(|n| (8..=15).contains(n))
+                    };
+                    if dag2(m_str, 'M').is_none() || dag2(i_str, 'I').is_none() {
+                        return Err(Error::Parse {
+                            line,
+                            msg: format!(
+                                "indirect JUMP/CALL needs a DAG2 pair (M8-M15, I8-I15), got \
+                                 `({inner})`"
+                            ),
+                        });
+                    }
+                    let mut after = rest[close + 1..].trim();
+                    let mut delayed = false;
+                    if after.starts_with('(') {
+                        let end = after.find(')').ok_or_else(|| Error::Parse {
+                            line,
+                            msg: format!("unterminated modifier in `{text}`"),
+                        })?;
+                        let modifier: String = after[1..end]
+                            .chars()
+                            .filter(|c| !c.is_whitespace())
+                            .collect();
+                        if modifier != "DB" {
+                            return Err(Error::Parse {
+                                line,
+                                msg: format!("unsupported indirect branch modifier `({modifier})`"),
+                            });
+                        }
+                        delayed = true;
+                        after = after[end + 1..].trim();
+                    }
+                    let (compute, else_compute) = if after.is_empty() {
+                        (None, false)
+                    } else if let Some(op) = after.strip_prefix(',') {
+                        let op = op.trim();
+                        let (op, else_compute) = match op.strip_prefix("ELSE ") {
+                            Some(rest) => (rest.trim(), true),
+                            None => (op, false),
+                        };
+                        (Some(parse_compute_op(op, line)?), else_compute)
+                    } else {
+                        return Err(Error::Parse {
+                            line,
+                            msg: format!("unexpected `{after}` after indirect JUMP/CALL"),
+                        });
+                    };
                     return Ok((
                         Instruction::IndirectBranch {
                             call,
@@ -1095,7 +1805,8 @@ fn parse_branch(text: &str, line: u32) -> Result<(Instruction, Option<String>)> 
                             pm_i: (i_code & 0xF) as u8,
                             pm_m: (m_code & 0xF) as u8,
                             delayed,
-                            compute: None,
+                            compute,
+                            else_compute,
                         },
                         None,
                     ));
@@ -1104,16 +1815,75 @@ fn parse_branch(text: &str, line: u32) -> Result<(Instruction, Option<String>)> 
         }
     }
 
-    // PC-relative or absolute — check for (DB) suffix
-    let delayed = rest.contains("(DB)");
-    let target_text = rest.replace("(DB)", "").trim().to_string();
-    let (target, label_ref) = parse_branch_target(&target_text, line)?;
+    let (branch, compute_text) = match find_comma_outside_parens(rest) {
+        Some(i) => (&rest[..i], Some(&rest[i + 1..])),
+        None => (rest, None),
+    };
+    let mut target_text = branch.trim();
+    let mut delayed = false;
+    let mut loop_abort = false;
+    // Accept combined (DB,LA) and separate (DB) (LA) modifiers, as
+    // printed by the vendor and our disassembler respectively.
+    while target_text.ends_with(')') {
+        let Some(open) = target_text.rfind('(') else {
+            break;
+        };
+        let flags = &target_text[open + 1..target_text.len() - 1];
+        if !flags.split(',').all(|f| matches!(f.trim(), "DB" | "LA")) {
+            break;
+        }
+        for flag in flags.split(',').map(str::trim) {
+            delayed |= flag == "DB";
+            loop_abort |= flag == "LA";
+        }
+        target_text = target_text[..open].trim();
+    }
+    let (target, label_ref) = parse_branch_target(target_text, line)?;
+    // The reference assembler also takes `(LA)` on a direct JUMP: `if ne jump _ext (la)` =
+    // 066000000000, bit 38 as for the PC-relative form.
+    // No vector covers CALL (LA).
+    if loop_abort && call {
+        return Err(Error::Parse {
+            line,
+            msg: "(LA) requires a JUMP".into(),
+        });
+    }
+    if let Some(compute) = compute_text {
+        let BranchTarget::PcRelative(offset) = target else {
+            return Err(Error::Parse {
+                line,
+                msg: "JUMP with compute requires (PC, offset)".into(),
+            });
+        };
+        if call || loop_abort || !(-32..=31).contains(&offset) {
+            return Err(Error::Parse {
+                line,
+                msg: "JUMP with compute requires a six-bit offset and no (LA)".into(),
+            });
+        }
+        let compute = compute.trim();
+        let (compute, else_compute) = match compute.strip_prefix("ELSE ") {
+            Some(s) => (s.trim(), true),
+            None => (compute, false),
+        };
+        return Ok((
+            Instruction::ComputeBranch {
+                cond: 31,
+                offset: offset as i8,
+                delayed,
+                else_compute,
+                compute: parse_compute_op(compute, line)?,
+            },
+            label_ref,
+        ));
+    }
     Ok((
         Instruction::Branch {
             call,
             cond: 31,
             target,
             delayed,
+            loop_abort,
         },
         label_ref,
     ))
@@ -1127,6 +1897,12 @@ fn parse_branch_target(text: &str, line: u32) -> Result<(BranchTarget, Option<St
             msg: "missing ')' in branch target".into(),
         })?;
         let inner = text[1..close].trim();
+        if !text[close + 1..].trim().is_empty() {
+            return Err(Error::Parse {
+                line,
+                msg: format!("unexpected text after branch target: {text}"),
+            });
+        }
         let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
         if parts.len() == 2 && parts[0] == "PC" {
             let s = parts[1].trim();
@@ -1142,15 +1918,24 @@ fn parse_branch_target(text: &str, line: u32) -> Result<(BranchTarget, Option<St
                         line,
                         msg: format!("invalid PC-relative offset: {s}"),
                     })?
+                } else if let Ok(v) = s.parse::<i32>() {
+                    v
+                } else if is_valid_label(s) {
+                    // `(PC, label)`: pass 2 resolves the offset (or emits a
+                    // PC-relative relocation). It used to become offset 0,
+                    // a jump to itself.
+                    return Ok((BranchTarget::PcRelative(0), Some(s.to_string())));
                 } else {
-                    // Symbolic label or decimal — treat as offset 0 for labels
-                    s.parse::<i32>().unwrap_or_default()
+                    return Err(Error::Parse {
+                        line,
+                        msg: format!("invalid PC-relative offset: {s}"),
+                    });
                 };
             return Ok((BranchTarget::PcRelative(offset), None));
         }
         // Single-operand: (label) is an absolute jump to a label
         if parts.len() == 1 {
-            let (addr, label_ref) = parse_address_or_label(parts[0], line)?;
+            let (addr, label_ref) = branch_address(parts[0], line)?;
             return Ok((BranchTarget::Absolute(addr), label_ref));
         }
         return Err(Error::Parse {
@@ -1160,8 +1945,32 @@ fn parse_branch_target(text: &str, line: u32) -> Result<(BranchTarget, Option<St
     }
 
     // Absolute address or symbolic label
-    let (addr, label_ref) = parse_address_or_label(text, line)?;
+    let (addr, label_ref) = branch_address(text, line)?;
     Ok((BranchTarget::Absolute(addr), label_ref))
+}
+
+/// A JUMP/CALL/CJUMP address: a label, or a number the reference assembler reads as a
+/// signed 24-bit field (32-bit values wrap first). `if eq jump -0x436fa5`
+/// = 060000bc905b and `cjump 0xffffffff ( db )` are accepted; `call
+/// 0x800000`, `call 0xb8d588` and `jump -0xc76fa5` are rejected (2,412 +
+/// 2,468 rows). selas refused the negative ones and truncated the rest.
+fn branch_address(s: &str, line: u32) -> Result<(u32, Option<String>)> {
+    let s = s.trim();
+    let Some(v) = parse_signed_number(s) else {
+        return parse_address_or_label(s, line);
+    };
+    let v = if (0x8000_0000..=0xFFFF_FFFF).contains(&v) {
+        v - (1 << 32)
+    } else {
+        v
+    };
+    if !(-0x80_0000..=0x7F_FFFF).contains(&v) {
+        return Err(Error::Parse {
+            line,
+            msg: format!("branch address {s} does not fit a signed 24-bit field"),
+        });
+    }
+    Ok(((v as u32) & 0xFF_FFFF, None))
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,6 +1992,7 @@ fn parse_conditional(text: &str, line: u32) -> Result<(Instruction, Option<Strin
         match &mut instr {
             Instruction::Branch { cond, .. } => *cond = cond_code,
             Instruction::IndirectBranch { cond, .. } => *cond = cond_code,
+            Instruction::ComputeBranch { cond, .. } => *cond = cond_code,
             _ => {}
         }
         return Ok((instr, label_ref));
@@ -1256,11 +2066,55 @@ fn parse_conditional(text: &str, line: u32) -> Result<(Instruction, Option<Strin
         return Ok((instr, None));
     }
 
+    // IF cond [compute ,] Ia = B2W|W2B (Ib) — `if not sv i0 = b2w ( i5 )` =
+    // 04af45800000.
+    let compact_rest: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact_rest.contains("=B2W(") || compact_rest.contains("=W2B(") {
+        return Ok((parse_dag_convert(rest, cond_code, line)?, None));
+    }
+
+    // IF cond Ia = MODIFY(Ib, Mm) — `if eq i0 = modify ( i4 , m4 ) ( nw )`
+    // = 048124000000.
+    if rest.starts_with('I') && find_comma_outside_parens(rest).is_none() {
+        if let Some(eq) = rest.find('=') {
+            let rhs = rest[eq + 1..].trim_start();
+            if rhs.starts_with("MODIFY(") || rhs.starts_with("MODIFY (") {
+                if let Instruction::DagModify {
+                    pm,
+                    i_reg,
+                    m_reg,
+                    dest_xor,
+                    width,
+                    ..
+                } = parse_modify_assign_inner(rest, line)?
+                {
+                    return Ok((
+                        Instruction::DagModify {
+                            pm,
+                            i_reg,
+                            m_reg,
+                            cond: cond_code,
+                            compute: None,
+                            dest_xor,
+                            width,
+                        },
+                        None,
+                    ));
+                }
+            }
+        }
+    }
+
     // IF cond MODIFY(Ii, Mm) — direct conditional MODIFY (no comma, no compute)
     if rest.starts_with("MODIFY(") || rest.starts_with("MODIFY (") {
         let modify = parse_dag_modify(rest, line)?;
         if let Instruction::DagModify {
-            pm, i_reg, m_reg, ..
+            pm,
+            i_reg,
+            m_reg,
+            dest_xor,
+            width,
+            ..
         } = modify
         {
             return Ok((
@@ -1270,6 +2124,8 @@ fn parse_conditional(text: &str, line: u32) -> Result<(Instruction, Option<Strin
                     m_reg,
                     cond: cond_code,
                     compute: None,
+                    dest_xor,
+                    width,
                 },
                 None,
             ));
@@ -1282,7 +2138,12 @@ fn parse_conditional(text: &str, line: u32) -> Result<(Instruction, Option<Strin
         if after_comma.starts_with("MODIFY(") || after_comma.starts_with("MODIFY (") {
             let modify = parse_dag_modify(after_comma, line)?;
             if let Instruction::DagModify {
-                pm, i_reg, m_reg, ..
+                pm,
+                i_reg,
+                m_reg,
+                dest_xor,
+                width,
+                ..
             } = modify
             {
                 return Ok((
@@ -1292,6 +2153,8 @@ fn parse_conditional(text: &str, line: u32) -> Result<(Instruction, Option<Strin
                         m_reg,
                         cond: cond_code,
                         compute: None,
+                        dest_xor,
+                        width,
                     },
                     None,
                 ));
@@ -1327,6 +2190,8 @@ fn parse_conditional(text: &str, line: u32) -> Result<(Instruction, Option<Strin
                 i_reg,
                 m_reg,
                 cond: _,
+                dest_xor,
+                width,
                 ..
             } = modify
             {
@@ -1337,6 +2202,8 @@ fn parse_conditional(text: &str, line: u32) -> Result<(Instruction, Option<Strin
                         m_reg,
                         cond: cond_code,
                         compute: Some(compute),
+                        dest_xor,
+                        width,
                     },
                     None,
                 ));
@@ -1413,6 +2280,9 @@ fn parse_conditional(text: &str, line: u32) -> Result<(Instruction, Option<Strin
         let dst = rest[..eq].trim();
         let src = rest[eq + 1..].trim();
         if let (Some(dst_code), Some(src_code)) = (ureg_code(dst), ureg_code(src)) {
+            if is_float_reg(dst) || is_float_reg(src) {
+                return Err(float_copy_error(dst, src, line));
+            }
             return Ok((
                 Instruction::UregTransfer {
                     src_ureg: src_code,
@@ -1448,6 +2318,8 @@ fn parse_conditional_mem(text: &str, cond: u8, line: u32) -> Result<Instruction>
             access,
             dreg,
             offset,
+            post_modify,
+            width,
             ..
         } => Ok(Instruction::ComputeLoadStore {
             compute,
@@ -1455,6 +2327,8 @@ fn parse_conditional_mem(text: &str, cond: u8, line: u32) -> Result<Instruction>
             dreg,
             offset,
             cond,
+            post_modify,
+            width,
         }),
         Instruction::UregDagMove {
             pm,
@@ -1464,6 +2338,7 @@ fn parse_conditional_mem(text: &str, cond: u8, line: u32) -> Result<Instruction>
             m_reg,
             compute,
             post_modify,
+            width,
             ..
         } => Ok(Instruction::UregDagMove {
             pm,
@@ -1474,8 +2349,36 @@ fn parse_conditional_mem(text: &str, cond: u8, line: u32) -> Result<Instruction>
             cond,
             compute,
             post_modify,
+            width,
         }),
-        other => Ok(other),
+        // Type 15 has no condition field. The reference assembler encodes a conditional
+        // dreg access with a 6-bit modifier as Type 4: `if sz r15=dm(-3,i6)`
+        // = 6c11efbf. Anything else must not silently lose its condition.
+        Instruction::UregMemAccess {
+            pm: false,
+            i_reg,
+            write,
+            lw: false,
+            ureg,
+            offset,
+        } if ureg < 0x10 && (-32..=63).contains(&offset) => Ok(Instruction::ComputeLoadStore {
+            compute: None,
+            access: MemAccess {
+                pm: false,
+                write,
+                i_reg,
+            },
+            dreg: ureg,
+            // `if not sz r2 = dm ( 0x20 , i5 )` = 6a31013f.
+            offset: type4_offset(offset, line)?,
+            cond,
+            post_modify: false,
+            width: selinstr::encode::DagWidth::Normal,
+        }),
+        _ => Err(Error::Parse {
+            line,
+            msg: "this memory access form cannot be conditional".into(),
+        }),
     }
 }
 
@@ -1489,12 +2392,29 @@ fn parse_condition_prefix(text: &str, line: u32) -> Result<(u8, &str)> {
             line,
             name: format!("NOT {cond_name}"),
         })?;
+        // NOT applies to AC .. LCE (codes 3-15); EQ, LT, LE and the
+        // already negated NE, GE, GT have their own names, and the reference assembler
+        // rejects `if not eq` etc. (82 rows each).
+        if !(3..=15).contains(&base) {
+            return Err(Error::Parse {
+                line,
+                msg: format!("NOT {cond_name} is not a condition"),
+            });
+        }
         let negated = negate_condition(base);
         return Ok((negated, rest));
     }
 
     // Single-word condition
     let (cond_name, rest) = split_first_space(text);
+    // Code 15 is LCE as a DO UNTIL terminator but NOT LCE after IF, so
+    // `IF LCE` assembled as `IF NOT LCE`; the reference assembler rejects it (71 rows).
+    if cond_name == "LCE" {
+        return Err(Error::Parse {
+            line,
+            msg: "IF LCE is not a condition; the IF form is IF NOT LCE".into(),
+        });
+    }
     let code = cond_code_base(cond_name).ok_or_else(|| Error::UnknownCondition {
         line,
         name: cond_name.to_string(),
@@ -1627,13 +2547,43 @@ fn parse_do_loop(text: &str, line: u32) -> Result<(Instruction, Option<String>)>
 
     let (end_pc, label_ref) = parse_address_or_label(addr_str.trim(), line)?;
 
+    // Termination must be LCE, optionally with the (F) suffix; anything else
+    // was previously ignored.
+    let until_pos = do_part.find("UNTIL").ok_or_else(|| Error::Parse {
+        line,
+        msg: "expected 'UNTIL' in DO loop".into(),
+    })?;
+    let term: String = do_part[until_pos + 5..]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let f = match term.as_str() {
+        "LCE" => false,
+        "LCE(F)" => true,
+        other => {
+            return Err(Error::Parse {
+                line,
+                msg: format!("unsupported DO loop termination: {other}"),
+            })
+        }
+    };
+
     // Counter is either a number or a register name
     let counter_str = counter_str.trim();
     if let Some(val) = parse_number(counter_str) {
+        // Type 12a holds a 16-bit count; the reference assembler rejects `lcntr = 0x10000`
+        // (24 rows), which selas truncated to 0.
+        if val > 0xFFFF {
+            return Err(Error::Parse {
+                line,
+                msg: format!("LCNTR count {counter_str} does not fit 16 bits"),
+            });
+        }
         Ok((
             Instruction::DoLoop {
                 counter: LoopCounter::Immediate(val as u16),
                 end_pc,
+                f,
             },
             label_ref,
         ))
@@ -1646,6 +2596,7 @@ fn parse_do_loop(text: &str, line: u32) -> Result<(Instruction, Option<String>)>
             Instruction::DoLoop {
                 counter: LoopCounter::Ureg(ureg as u8),
                 end_pc,
+                f,
             },
             label_ref,
         ))
@@ -1661,13 +2612,29 @@ fn parse_do_until(text: &str, line: u32) -> Result<(Instruction, Option<String>)
     })?;
     let addr_str = rest[..until_pos].trim();
     let term_str = rest[until_pos + 5..].trim();
+    let packed: String = term_str.chars().filter(|c| !c.is_whitespace()).collect();
+    let f = packed.ends_with("(F)");
+    let term_str = if f {
+        packed.trim_end_matches("(F)")
+    } else {
+        term_str
+    };
 
     let (addr, label_ref) = parse_address_or_label(addr_str, line)?;
     let term = cond_code_base(term_str).ok_or_else(|| Error::UnknownCondition {
         line,
         name: term_str.to_string(),
     })?;
-    Ok((Instruction::DoUntil { addr, term }, label_ref))
+    // The reference assembler rejects a fast loop with a termination condition other
+    // than LCE (`do _x until eq (f)`, SW and NW).
+    const LCE: u8 = 15;
+    if f && term != LCE {
+        return Err(Error::Parse {
+            line,
+            msg: "a fast loop `(F)` needs the LCE termination condition (reference assembler)".into(),
+        });
+    }
+    Ok((Instruction::DoUntil { addr, term, f }, label_ref))
 }
 
 // ---------------------------------------------------------------------------
@@ -1679,10 +2646,14 @@ fn parse_bit_op(text: &str, line: u32) -> Result<Instruction> {
     let rest = text[4..].trim(); // skip "BIT "
     let (opname, after_op) = split_first_space(rest);
     let op = match opname {
+        // The BOP field (bits 39:37). The reference assembler: `bit tgl mode1 0x0` =
+        // 144200000000, `bit xor mode1 0x0` = 14a200000000; selas encoded
+        // TGL as XOR.
         "SET" => 0,
         "CLR" => 1,
-        "TST" => 2,
-        "XOR" | "TGL" => 3,
+        "TGL" => 2,
+        "TST" => 4,
+        "XOR" => 5,
         _ => {
             return Err(Error::Parse {
                 line,
@@ -1725,22 +2696,31 @@ fn parse_bit_op(text: &str, line: u32) -> Result<Instruction> {
             break;
         }
     }
-    let data = if let Some(hex) = inner.strip_prefix('-') {
-        let hex = hex.trim();
-        let val = parse_number(hex).ok_or_else(|| Error::Parse {
+    // Evaluate wide so an out-of-range value is an error, not truncated.
+    let wide = |s: &str| -> Option<i64> {
+        let s = s.trim();
+        if let Some(hex) = s.strip_prefix("0X").or_else(|| s.strip_prefix("0x")) {
+            if let Ok(v) = i64::from_str_radix(hex, 16) {
+                return Some(v);
+            }
+        }
+        s.parse::<i64>().ok().or_else(|| eval_const_expr(s))
+    };
+    let data = if let Some(rest) = inner.strip_prefix('-') {
+        let val = wide(rest).ok_or_else(|| Error::Parse {
             line,
             msg: format!("invalid BIT data: {data_str}"),
         })?;
-        (-(val as i64)) as u32
-    } else if let Some(val) = parse_number(inner) {
-        val
-    } else if let Some(val) = eval_const_expr(inner) {
-        val as u32
+        fit_data32(-val, "BIT data", line)? as u32
+    } else if let Some(val) = wide(inner) {
+        fit_data32(val, "BIT data", line)? as u32
     } else {
-        // Undefined symbol (e.g. from missing system header) — emit 0 as
-        // placeholder so assembly can continue (P1G tolerance).
-        eprintln!("warning: line {line}: unresolved BIT data \"{data_str}\", using 0");
-        0
+        // BIT data must be a constant: the reference assembler rejects `bit clr mode1
+        // 0xzz`. selas warned and used 0, a BIT op that did nothing.
+        return Err(Error::Parse {
+            line,
+            msg: format!("BIT data is not a constant: {data_str}"),
+        });
     };
 
     Ok(Instruction::BitOp { op, sreg, data })
@@ -1748,7 +2728,11 @@ fn parse_bit_op(text: &str, line: u32) -> Result<Instruction> {
 
 /// Map system register name to the 5-bit sreg code used in BIT ops (Type 18).
 fn bit_op_sreg_code(name: &str) -> Option<u8> {
+    // The low nibble of the group-7 universal register code: vendor
+    // `bit tst ustat1 0x0` = 148000000000.
     match name {
+        "USTAT1" => Some(0x00),
+        "USTAT2" => Some(0x01),
         "MODE1" => Some(0x02),
         "MMASK" => Some(0x03),
         "MODE2" => Some(0x04),
@@ -1761,6 +2745,8 @@ fn bit_op_sreg_code(name: &str) -> Option<u8> {
         "IMASK" => Some(0x0B),
         "IMASKP" => Some(0x0C),
         "MODE1STK" => Some(0x0D),
+        "USTAT3" => Some(0x0E),
+        "USTAT4" => Some(0x0F),
         _ => None,
     }
 }
@@ -1804,19 +2790,74 @@ fn stack_op_bit(text: &str) -> Option<u8> {
 fn parse_cjump(text: &str, line: u32) -> Result<(Instruction, Option<String>)> {
     // "CJUMP 0x001234 (DB)" or "CJUMP 0x001234"
     let rest = text[5..].trim(); // skip "CJUMP"
-    let delayed = rest.contains("(DB)");
-    let addr_str = if delayed {
-        rest.replace("(DB)", "")
-    } else {
-        rest.to_string()
+                                 // The reference assembler rejects CJUMP without (DB) (all 176 rows) and writes the
+                                 // suffix spaced as often as not (`cjump -0x436e00 ( db )`).
+    let (addr_str, suffix) = match rest.rfind('(') {
+        Some(open) if rest.ends_with(')') => (&rest[..open], &rest[open..]),
+        _ => (rest, ""),
     };
-    let (addr, label_ref) = parse_address_or_label(addr_str.trim(), line)?;
-    Ok((Instruction::CJump { addr, delayed }, label_ref))
+    let packed: String = suffix.chars().filter(|c| !c.is_whitespace()).collect();
+    if packed != "(DB)" {
+        return Err(Error::Parse {
+            line,
+            msg: format!("CJUMP must be delayed, `CJUMP addr (DB)`: {text}"),
+        });
+    }
+    let (target, label_ref) = parse_branch_target(addr_str.trim(), line)?;
+    let (addr, relative) = match target {
+        BranchTarget::Absolute(addr) => (addr, false),
+        BranchTarget::PcRelative(offset) => (offset as u32, true),
+    };
+    Ok((
+        Instruction::CJump {
+            addr,
+            delayed: true,
+            relative,
+        },
+        label_ref,
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // MODIFY(Ii, Mm) — DAG register modify (Type 7)
 // ---------------------------------------------------------------------------
+
+/// The suffix after `MODIFY(Ii, data)`. The reference assembler writes `( nw )` with
+/// spaces as often as `(nw)` (`modify ( i0 , 0x7 ) ( nw )` =
+/// 158000000007); selas matched only the packed spelling and silently
+/// encoded the spaced one as a plain MODIFY.
+fn modify_width(suffix: &str, line: u32) -> Result<MemWidth> {
+    let packed: String = suffix.chars().filter(|c| !c.is_whitespace()).collect();
+    match packed.to_uppercase().as_str() {
+        "" => Ok(MemWidth::Normal),
+        "(NW)" => Ok(MemWidth::Nw),
+        "(SW)" => Ok(MemWidth::Sw),
+        _ => Err(Error::Parse {
+            line,
+            msg: format!("unknown MODIFY modifier: {}", suffix.trim()),
+        }),
+    }
+}
+
+/// A 32-bit immediate field (MODIFY data, BIT data, a Type 15 offset)
+/// takes any value of magnitude below 2^32, wrapped (`astatx = dm (
+/// -0x80000001 , i6 )` = ac767fffffff); the reference assembler rejects `modify ( i0 ,
+/// 0x100000000 )`, `bit set mode1 0x100000000` and `astatx = dm (
+/// -0x100000000 , i6 )`, which selas truncated.
+fn fit_data32(value: i64, what: &str, line: u32) -> Result<i32> {
+    if (-0xFFFF_FFFF..=0xFFFF_FFFF).contains(&value) {
+        Ok(value as u32 as i32)
+    } else {
+        Err(Error::Parse {
+            line,
+            msg: if value < 0 {
+                format!("{what} -{:#x} does not fit 32 bits", -value)
+            } else {
+                format!("{what} {value:#x} does not fit 32 bits")
+            },
+        })
+    }
+}
 
 fn parse_dag_modify(text: &str, line: u32) -> Result<Instruction> {
     // "MODIFY(I0, M1)" or "MODIFY (I0, M1)" or "MODIFY(I7, -4)" or "BITREV(I14, 0)"
@@ -1843,18 +2884,18 @@ fn parse_dag_modify(text: &str, line: u32) -> Result<Instruction> {
     // Check for immediate offset (Type 19): MODIFY(Ii, <number>) or expression
     let imm_from_expr = parse_signed_number(parts[1]).or_else(|| eval_const_expr(parts[1]));
     if let Some(imm_val) = imm_from_expr {
-        // Check for (NW) suffix after the closing paren
-        let after_close = text[close + 1..].trim();
-        let width = if after_close.starts_with("(NW)") || after_close.contains("NWOPT") {
+        let after_close = &text[close + 1..];
+        let width = if after_close.contains("NWOPT") {
             MemWidth::Nw
         } else {
-            MemWidth::Normal
+            modify_width(after_close, line)?
         };
         return Ok(Instruction::Modify {
             i_reg: i_reg_full,
-            value: imm_val as i32,
+            value: fit_data32(imm_val, "MODIFY offset", line)?,
             width,
             bitrev: is_bitrev,
+            dest_xor: 0,
         });
     }
 
@@ -1865,12 +2906,63 @@ fn parse_dag_modify(text: &str, line: u32) -> Result<Instruction> {
     let i_reg = if pm { i_reg_full - 8 } else { i_reg_full };
     let m_reg = if pm { m_reg_full - 8 } else { m_reg_full };
 
+    let width = modify_width(&text[close + 1..], line)?;
     Ok(Instruction::DagModify {
         pm,
         i_reg,
         m_reg,
         cond: 31,
         compute: None,
+        dest_xor: 0,
+        width,
+    })
+}
+
+/// `[compute ,] Ia = B2W|W2B (Ib)` or the same on B registers, upper-cased
+/// (Instruction::DagConvert). Both registers sit in one DAG (the reference assembler
+/// rejects `i15 = b2w ( i7 )`).
+fn parse_dag_convert(text: &str, cond: u8, line: u32) -> Result<Instruction> {
+    let (compute, conv) = match find_all_commas_outside_parens(text).last() {
+        Some(&comma) => (
+            Some(parse_compute_op(text[..comma].trim(), line)?),
+            text[comma + 1..].trim(),
+        ),
+        None => (None, text.trim()),
+    };
+    let bad = || Error::Parse {
+        line,
+        msg: format!("expected `Ia = B2W|W2B (Ib)` or `Ba = B2W|W2B (Bb)`: {conv}"),
+    };
+    let (lhs, rhs) = conv.split_once('=').ok_or_else(bad)?;
+    let lhs = lhs.trim();
+    let rhs: String = rhs.chars().filter(|c| !c.is_whitespace()).collect();
+    let (w2b, operand) = if let Some(r) = rhs.strip_prefix("B2W(") {
+        (false, r)
+    } else if let Some(r) = rhs.strip_prefix("W2B(") {
+        (true, r)
+    } else {
+        return Err(bad());
+    };
+    let operand = operand.strip_suffix(')').ok_or_else(bad)?;
+    let prefix = match lhs.chars().next() {
+        Some(c @ ('I' | 'B')) => c,
+        _ => return Err(bad()),
+    };
+    let dst = parse_reg_index(lhs, prefix, line)?;
+    let src = parse_reg_index(operand, prefix, line)?;
+    if (dst >= 8) != (src >= 8) {
+        return Err(Error::Parse {
+            line,
+            msg: format!("{lhs} and {operand} must be in one DAG"),
+        });
+    }
+    Ok(Instruction::DagConvert {
+        pm: src >= 8,
+        dest_xor: (dst ^ src) & 7,
+        i_reg: src & 7,
+        op: u8::from(prefix == 'B') << 1 | u8::from(w2b),
+        cond,
+        compute,
     })
 }
 
@@ -1881,8 +2973,10 @@ fn parse_dag_modify(text: &str, line: u32) -> Result<Instruction> {
 fn parse_modify_assign(text: &str, line: u32) -> Result<Instruction> {
     // "I7=MODIFY (I7,M6)(NW)" or "I4=MODIFY (I4,0x4)"
     // Also handles compound: "compute , I7=MODIFY (I7,M6)(NW)"
-    // Check for compound with comma
-    if let Some(comma) = find_comma_outside_parens(text) {
+    // Check for compound with comma; split at the last one so a
+    // multifunction compute stays whole (`f1 = f1 * f7 , f12 = f8 + f12 ,
+    // i1 = modify ( i1 , m4 )` = 043e60581c70).
+    if let Some(&comma) = find_all_commas_outside_parens(text).last() {
         let before = text[..comma].trim();
         let after = text[comma + 1..].trim();
         if after.contains("MODIFY") {
@@ -1895,6 +2989,8 @@ fn parse_modify_assign(text: &str, line: u32) -> Result<Instruction> {
                     i_reg,
                     m_reg,
                     cond,
+                    dest_xor,
+                    width,
                     ..
                 } => Ok(Instruction::DagModify {
                     pm,
@@ -1902,6 +2998,8 @@ fn parse_modify_assign(text: &str, line: u32) -> Result<Instruction> {
                     m_reg,
                     cond,
                     compute: Some(compute),
+                    dest_xor,
+                    width,
                 }),
                 Instruction::Modify { i_reg, value, .. } => {
                     // Type 19 Modify doesn't have a compute field
@@ -1946,6 +3044,19 @@ fn parse_modify_assign_inner(text: &str, line: u32) -> Result<Instruction> {
     }
 
     let i_reg_full = parse_reg_index(parts[0], 'I', line)?;
+    // `Ia = MODIFY(Ib, ...)` writes Ia; the encoding carries Ia XOR Ib
+    // (0 for Ia == Ib, which matches the two-operand form). The reference assembler:
+    // `i4 = modify(i4, 0x10)` = 160400000010, `i2 = modify(i4, 0x1a)` =
+    // 16340000001a, `i1 = modify(i0,m4)` = 043e213f.
+    let lhs = text[..eq].rsplit(',').next().unwrap_or("").trim();
+    let dest_full = parse_reg_index(lhs, 'I', line)?;
+    if (dest_full >= 8) != (i_reg_full >= 8) {
+        return Err(Error::Parse {
+            line,
+            msg: format!("{lhs} = MODIFY({}, ...) must stay within one DAG", parts[0]),
+        });
+    }
+    let dest_xor = (dest_full ^ i_reg_full) & 7;
 
     // Check if second operand is M-register (Type 7) or immediate (Type 19)
     if parts[1].starts_with('M') {
@@ -1953,34 +3064,34 @@ fn parse_modify_assign_inner(text: &str, line: u32) -> Result<Instruction> {
         let pm = i_reg_full >= 8;
         let i_reg = if pm { i_reg_full - 8 } else { i_reg_full };
         let m_reg = if pm { m_reg_full - 8 } else { m_reg_full };
+        // `i0 = modify ( i4 , m4 ) ( sw )` = 043f24800000 (bit 23),
+        // `r0 = r2 and r1 , i2 = modify ( i2 , m6 ) ( nw )` = 04beb0040021
+        // (bit 39).
+        let width = modify_width(&rhs[close + 1..], line)?;
         Ok(Instruction::DagModify {
             pm,
             i_reg,
             m_reg,
             cond: 31,
             compute: None,
+            dest_xor,
+            width,
         })
     } else {
         // Immediate: "I4=MODIFY (I4,0x4)" or "I4=MODIFY (I4,0x4)(NW)"
         let value = parse_signed_number(parts[1]).ok_or_else(|| Error::Parse {
             line,
             msg: format!("invalid MODIFY offset: {}", parts[1]),
-        })? as i32;
-        // Check for width modifier after the closing parenthesis
-        let after_paren = rhs[close + 1..].trim().to_uppercase();
-        let width = if after_paren.starts_with("(NW)") {
-            MemWidth::Nw
-        } else if after_paren.starts_with("(SW)") {
-            MemWidth::Sw
-        } else {
-            MemWidth::Normal
-        };
+        })?;
+        let value = fit_data32(value, "MODIFY offset", line)?;
+        let width = modify_width(&rhs[close + 1..], line)?;
         let bitrev = rhs.starts_with("BITREV");
         Ok(Instruction::Modify {
             i_reg: i_reg_full,
             value,
             width,
             bitrev,
+            dest_xor,
         })
     }
 }
@@ -1989,48 +3100,117 @@ fn parse_modify_assign_inner(text: &str, line: u32) -> Result<Instruction> {
 // Memory access
 // ---------------------------------------------------------------------------
 
-/// A direct load or store with a (BW), (BWSE), (SW) or (SWSE) suffix is Type 14d (a data register and DM only), not Type 14.
-fn sub_word_abs(
-    width_mod: Option<&str>,
-    pm: bool,
-    write: bool,
-    ureg: u16,
-    addr: u32,
-    line: u32,
-) -> Result<Option<Instruction>> {
-    let (short, signed) = match width_mod {
-        Some("(BW)") => (false, false),
-        Some("(BWSE)") => (false, true),
-        Some("(SW)") => (true, false),
-        Some("(SWSE)") => (true, true),
-        _ => return Ok(None),
-    };
-    if pm || ureg > 15 {
-        return Err(Error::Parse {
-            line,
-            msg: "(BW)/(SW) on a direct access needs DM and a data register R0-R15".into(),
-        });
-    }
-    if write && signed {
-        return Err(Error::Parse {
-            line,
-            msg: "(BWSE)/(SWSE) is for loads only".into(),
-        });
-    }
-    Ok(Some(Instruction::SubWordAbsAccess {
-        write,
-        short,
-        signed,
-        dreg: ureg,
-        addr,
-    }))
-}
-
 fn parse_mem_access(text: &str, line: u32) -> Result<(Instruction, Option<String>)> {
-    // Extract memory width modifier before stripping
     let (text, width_mod) = extract_width_modifier(text);
     let is_lw = width_mod == Some("(LW)");
+    let (mut instr, symbol) = parse_mem_access_inner(text, is_lw, line)?;
+    // `Rn = DM(imm, Ii)(SW|BW)`: the reference assembler emits the 32-bit Type 4b form
+    // with width marker 0x3c / 0x38 (683e163c, 683e0938).
+    // The sign-extending widths and PM take the same form (`r0 = dm (
+    // -0x2 , i4 ) ( swse )` = 683ff03d, `r0 = pm ( 0x0 , i12 ) ( sw )` =
+    // 693e003c), offsets -0x20..=0x3f as in type4_offset.
+    let narrow = match width_mod {
+        Some("(SW)") => Some(DagWidth::Short),
+        Some("(BW)") => Some(DagWidth::Byte),
+        Some("(SWSE)") => Some(DagWidth::ShortSe),
+        Some("(BWSE)") => Some(DagWidth::ByteSe),
+        _ => None,
+    };
+    // Stores use the same marker with the write bit set: no listing row
+    // has one, but a binary round-trip reproduces 86 such vendor
+    // words byte for byte.
+    if let (
+        Some(width),
+        None,
+        Instruction::UregMemAccess {
+            pm,
+            lw: false,
+            i_reg,
+            write,
+            ureg,
+            offset,
+        },
+    ) = (narrow, &symbol, &instr)
+    {
+        // i_reg is DAG-local here (PM I8-I15 -> 0-7).
+        if *ureg < 0x10 && *i_reg < 8 && (-32..=63).contains(offset) {
+            let access = MemAccess {
+                pm: *pm,
+                write: *write,
+                i_reg: *i_reg,
+            };
+            instr = Instruction::ComputeLoadStore {
+                compute: None,
+                access,
+                dreg: *ureg,
+                offset: type4_offset(*offset, line)?,
+                cond: 31,
+                post_modify: false,
+                width,
+            };
+            return Ok((instr, symbol));
+        }
+    }
+    match (width_mod, &mut instr) {
+        (None | Some("(NW)"), _) => {}
+        (Some("(LW)"), Instruction::UregMemAccess { .. }) => {}
+        (Some(modifier), Instruction::UregAbsAccess { width, .. }) if modifier != "(NW)" => {
+            *width = match modifier {
+                "(LW)" => DagWidth::Long,
+                "(SW)" => DagWidth::Short,
+                "(BW)" => DagWidth::Byte,
+                "(SWSE)" => DagWidth::ShortSe,
+                _ => DagWidth::ByteSe,
+            };
+        }
+        (Some("(SW)"), Instruction::UregDagMove { width, .. }) => {
+            *width = DagWidth::Short;
+        }
+        (Some("(BW)"), Instruction::UregDagMove { width, .. }) => {
+            *width = DagWidth::Byte;
+        }
+        (Some("(LW)"), Instruction::UregDagMove { width, .. }) => {
+            *width = DagWidth::Long;
+        }
+        (Some("(SWSE)"), Instruction::UregDagMove { width, .. }) => {
+            *width = DagWidth::ShortSe;
+        }
+        (Some("(BWSE)"), Instruction::UregDagMove { width, .. }) => {
+            *width = DagWidth::ByteSe;
+        }
+        // `Rn = DM(Ii, imm)(SW|BW)`, the post-modify Type 4b form
+        // (the reference assembler 687e0838 `r0 = dm(i4, 1)(bw)`).
+        (
+            Some(modifier @ ("(SW)" | "(BW)" | "(SWSE)" | "(BWSE)")),
+            Instruction::ComputeLoadStore {
+                compute: None,
+                post_modify: true,
+                width,
+                ..
+            },
+        ) => {
+            *width = match modifier {
+                "(SW)" => DagWidth::Short,
+                "(BW)" => DagWidth::Byte,
+                "(SWSE)" => DagWidth::ShortSe,
+                _ => DagWidth::ByteSe,
+            };
+        }
+        (Some(modifier), _) => {
+            return Err(Error::Parse {
+                line,
+                msg: format!("unsupported memory access modifier {modifier} for this instruction"),
+            });
+        }
+    }
+    Ok((instr, symbol))
+}
 
+fn parse_mem_access_inner(
+    text: &str,
+    is_lw: bool,
+    line: u32,
+) -> Result<(Instruction, Option<String>)> {
     // Check for dual DM+PM move without compute
     if let Some(dual) = try_parse_dual_move("", text, line)? {
         return Ok((dual, None));
@@ -2060,17 +3240,15 @@ fn parse_mem_access(text: &str, line: u32) -> Result<(Instruction, Option<String
         let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
         if parts.len() == 1 {
             // Single operand: absolute address (Type 14)
-            let (addr, sym) = resolve_abs_addr(parts[0], line);
+            let (addr, sym) = resolve_abs_addr(parts[0], line)?;
             let ureg = parse_ureg_or_dreg(rhs, line)?;
-            if let Some(instr) = sub_word_abs(width_mod, pm, true, ureg, addr, line)? {
-                return Ok((instr, sym));
-            }
             return Ok((
                 Instruction::UregAbsAccess {
                     pm,
                     write: true,
                     ureg,
                     addr,
+                    width: DagWidth::Normal,
                 },
                 sym,
             ));
@@ -2088,17 +3266,15 @@ fn parse_mem_access(text: &str, line: u32) -> Result<(Instruction, Option<String
         let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
         if parts.len() == 1 {
             // Single operand: absolute address (Type 14)
-            let (addr, sym) = resolve_abs_addr(parts[0], line);
+            let (addr, sym) = resolve_abs_addr(parts[0], line)?;
             let ureg = parse_ureg_or_dreg(lhs, line)?;
-            if let Some(instr) = sub_word_abs(width_mod, pm, false, ureg, addr, line)? {
-                return Ok((instr, sym));
-            }
             return Ok((
                 Instruction::UregAbsAccess {
                     pm,
                     write: false,
                     ureg,
                     addr,
+                    width: DagWidth::Normal,
                 },
                 sym,
             ));
@@ -2126,6 +3302,7 @@ fn has_mem_prefix(s: &str) -> bool {
 /// Build a UregDagMove from two memory operands (I-reg and M-reg, either order).
 /// Returns None if neither operand pair is I+M or M+I.
 fn try_build_dag_move(
+    pm: bool,
     op1: &str,
     op2: &str,
     ureg_name: &str,
@@ -2151,6 +3328,12 @@ fn try_build_dag_move(
     let m_reg_full = parse_reg_index(m_str, 'M', line)?;
     let ureg = parse_ureg_or_dreg(ureg_name, line)?;
     let dag_pm = i_reg_full >= 8;
+    if dag_pm != pm || (m_reg_full >= 8) != pm {
+        return Err(Error::Parse {
+            line,
+            msg: "DM requires DAG1 registers; PM requires DAG2 registers".into(),
+        });
+    }
     let i_reg = if dag_pm { i_reg_full - 8 } else { i_reg_full };
     let m_reg = if dag_pm {
         m_reg_full.wrapping_sub(8)
@@ -2166,6 +3349,7 @@ fn try_build_dag_move(
         cond: 31,
         compute,
         post_modify,
+        width: DagWidth::Normal,
     }))
 }
 
@@ -2178,6 +3362,15 @@ fn parse_mem_store(
     is_lw: bool,
     line: u32,
 ) -> Result<(Instruction, Option<String>)> {
+    if rhs.trim_end().rsplit_once('(').is_some_and(|(_, tail)| {
+        tail.strip_suffix(')')
+            .is_some_and(|modifier| modifier.trim() == "SE")
+    }) {
+        return Err(Error::Parse {
+            line,
+            msg: "(se) is not a memory access modifier".into(),
+        });
+    }
     // Type 16: DM|PM(Ii, Mm) = imm32 or symbolic label
     if op1.starts_with('I') && op2.starts_with('M') || op1.starts_with('M') && op2.starts_with('I')
     {
@@ -2195,7 +3388,8 @@ fn parse_mem_store(
             let i_reg = if pm { i_raw.wrapping_sub(8) } else { i_raw };
             let m_reg = if pm { m_raw.wrapping_sub(8) } else { m_raw };
             let (value, sym) = if let Some(v) = parse_signed_number(rhs) {
-                (v as u32, None)
+                // The reference assembler rejects `dm ( i7 , m7 ) = 0x100000000`.
+                (fit_data32(v, "immediate", line)? as u32, None)
             } else if let Some((label, adj)) = split_label_addend(rhs) {
                 (adj as i32 as u32, Some(label.to_string()))
             } else {
@@ -2213,12 +3407,18 @@ fn parse_mem_store(
         }
     }
 
-    if let Some(dag_move) = try_build_dag_move(op1, op2, rhs, true, None, line)? {
+    if let Some(dag_move) = try_build_dag_move(pm, op1, op2, rhs, true, None, line)? {
         return Ok((dag_move, None));
     }
 
-    let (i_reg, offset) = parse_ireg_and_offset(op1, op2, line)?;
+    let (i_reg, offset, post_modify) = parse_ireg_and_offset(op1, op2, line)?;
     let i_field = if pm { i_reg.wrapping_sub(8) } else { i_reg };
+    if post_modify {
+        return Ok((
+            post_modify_imm_access(pm, true, is_lw, rhs, i_field, offset, line)?,
+            None,
+        ));
+    }
     if let Ok(dreg) = parse_dreg(rhs, line) {
         return Ok((
             Instruction::UregMemAccess {
@@ -2260,15 +3460,18 @@ fn parse_mem_load(
     is_lw: bool,
     line: u32,
 ) -> Result<Instruction> {
-    if let Some(dag_move) = try_build_dag_move(op1, op2, dest, false, None, line)? {
+    if let Some(dag_move) = try_build_dag_move(pm, op1, op2, dest, false, None, line)? {
         return Ok(dag_move);
     }
 
     // Numeric offset: dreg = DM(imm, Ii) or dreg = DM(Ii, imm)
     // Always use Type 15 for standalone loads with integer offsets.
     // Type 4 is only used when a parallel compute is present.
-    let (i_reg, offset) = parse_ireg_and_offset(op1, op2, line)?;
+    let (i_reg, offset, post_modify) = parse_ireg_and_offset(op1, op2, line)?;
     let i_field = if pm { i_reg.wrapping_sub(8) } else { i_reg };
+    if post_modify {
+        return post_modify_imm_access(pm, false, is_lw, dest, i_field, offset, line);
+    }
     if let Ok(dreg) = parse_dreg(dest, line) {
         let ureg = dreg; // R0-R15 have ureg codes 0x00-0x0F
         return Ok(Instruction::UregMemAccess {
@@ -2298,30 +3501,78 @@ fn parse_mem_load(
 }
 
 /// Parse I-register and immediate offset from two operands.
-/// Handles both orders: (Ii, imm) and (imm, Ii).
-/// Returns the full i32 offset so callers can decide between Type 4 (6-bit)
-/// and Type 15 (32-bit) encoding.
-fn parse_ireg_and_offset(op1: &str, op2: &str, line: u32) -> Result<(u8, i32)> {
+/// `(Ii, imm)` is post-modify (access Ii, then Ii += imm) and `(imm, Ii)` is
+/// pre-modify (access Ii+imm, Ii unchanged); the third value is true for
+/// post-modify. Returns the full i32 offset so callers can decide between
+/// Type 4 (6-bit) and Type 15 (32-bit, pre-modify only) encoding.
+fn parse_ireg_and_offset(op1: &str, op2: &str, line: u32) -> Result<(u8, i32, bool)> {
     if op1.starts_with('I') {
         let i_reg = parse_reg_index(op1, 'I', line)?;
         let offset = parse_signed_number(op2).ok_or_else(|| Error::Parse {
             line,
             msg: format!("invalid offset: {op2}"),
         })?;
-        Ok((i_reg, offset as i32))
+        Ok((i_reg, fit_data32(offset, "offset", line)?, true))
     } else if op2.starts_with('I') {
         let i_reg = parse_reg_index(op2, 'I', line)?;
         let offset = parse_signed_number(op1).ok_or_else(|| Error::Parse {
             line,
             msg: format!("invalid offset: {op1}"),
         })?;
-        Ok((i_reg, offset as i32))
+        Ok((i_reg, fit_data32(offset, "offset", line)?, false))
     } else {
         Err(Error::Parse {
             line,
             msg: format!("expected I-register in memory operands: {op1}, {op2}"),
         })
     }
+}
+
+/// Type 4 data6 offset, range-checked before narrowing. The reference assembler takes
+/// -0x20..=0x3f and keeps the low six bits (`r0 = dm(i0, 0x3f)` =
+/// 607ff83f, `dm ( i4 , 0x20 ) = r2` = 68ff013f; 0x40 and -0x21 are
+/// rejected).
+fn type4_offset(offset: i32, line: u32) -> Result<i8> {
+    if (-32..=63).contains(&offset) {
+        Ok(((offset << 26) >> 26) as i8)
+    } else {
+        Err(Error::Parse {
+            line,
+            msg: format!("immediate modifier {offset} out of 6-bit range (-0x20..0x3f)"),
+        })
+    }
+}
+
+/// Standalone post-modify `DM|PM(Ii,imm)` access: only Type 4 (dreg,
+/// 6-bit modifier) can update Ii by an immediate. PM: `r0 = pm ( i8 ,
+/// 0x0 )` = 617e003f.
+fn post_modify_imm_access(
+    pm: bool,
+    write: bool,
+    is_lw: bool,
+    reg: &str,
+    i_reg: u8,
+    offset: i32,
+    line: u32,
+) -> Result<Instruction> {
+    let dreg =
+        match parse_dreg(reg, line) {
+            Ok(d) if !is_lw && i_reg < 8 => d,
+            _ => return Err(Error::Parse {
+                line,
+                msg: "post-modify DM|PM(Ii,imm) is only supported for R0-R15 accesses without (LW)"
+                    .into(),
+            }),
+        };
+    Ok(Instruction::ComputeLoadStore {
+        compute: None,
+        access: MemAccess { pm, write, i_reg },
+        dreg,
+        offset: type4_offset(offset, line)?,
+        cond: 31,
+        post_modify: true,
+        width: selinstr::encode::DagWidth::Normal,
+    })
 }
 
 /// Parse a ureg name, falling back to dreg (R0-R15/F0-F15) codes.
@@ -2395,6 +3646,7 @@ fn try_parse_compound_mem(text: &str, line: u32) -> Result<Option<Instruction>> 
             i_reg,
             m_reg,
             cond,
+            width,
             ..
         } = modify
         {
@@ -2404,6 +3656,8 @@ fn try_parse_compound_mem(text: &str, line: u32) -> Result<Option<Instruction>> 
                 m_reg,
                 cond,
                 compute: Some(compute),
+                dest_xor: 0,
+                width,
             }));
         }
     }
@@ -2462,6 +3716,14 @@ fn try_parse_compound_mem(text: &str, line: u32) -> Result<Option<Instruction>> 
             };
             let i_reg = parse_reg_index(i_str, 'I', line)?;
             let m_reg = parse_reg_index(m_str, 'M', line)?;
+            // DAG1 only: the reference assembler rejects `btst r10 by 0xa , dm ( i11 , m5 )
+            // = r2` and `dm ( i3 , m13 )`.
+            if i_reg > 7 || m_reg > 7 {
+                return Err(Error::Parse {
+                    line,
+                    msg: "Type 6a (immediate shift + memory) takes I0-I7 and M0-M7".into(),
+                });
+            }
             let (write, dreg_str) = if lhs_has_mem {
                 (true, mem_rhs)
             } else {
@@ -2497,12 +3759,12 @@ fn try_parse_compound_mem(text: &str, line: u32) -> Result<Option<Instruction>> 
             });
         }
         if let Some(dag) =
-            try_build_dag_move(parts[0], parts[1], mem_rhs, true, Some(compute), line)?
+            try_build_dag_move(pm, parts[0], parts[1], mem_rhs, true, Some(compute), line)?
         {
             return Ok(Some(dag));
         }
         // Numeric offset (Type 4 with compute)
-        let (i_reg, offset) = parse_ireg_and_offset(parts[0], parts[1], line)?;
+        let (i_reg, offset, post_modify) = parse_ireg_and_offset(parts[0], parts[1], line)?;
         let dreg = parse_dreg(mem_rhs, line)?;
         let i_field = if pm { i_reg.wrapping_sub(8) } else { i_reg };
         Ok(Some(Instruction::ComputeLoadStore {
@@ -2513,8 +3775,10 @@ fn try_parse_compound_mem(text: &str, line: u32) -> Result<Option<Instruction>> 
                 i_reg: i_field,
             },
             dreg,
-            offset: offset as i8,
+            offset: type4_offset(offset, line)?,
             cond: 31,
+            post_modify,
+            width: selinstr::encode::DagWidth::Normal,
         }))
     } else {
         // Load with compute
@@ -2527,12 +3791,12 @@ fn try_parse_compound_mem(text: &str, line: u32) -> Result<Option<Instruction>> 
             });
         }
         if let Some(dag) =
-            try_build_dag_move(parts[0], parts[1], mem_lhs, false, Some(compute), line)?
+            try_build_dag_move(pm, parts[0], parts[1], mem_lhs, false, Some(compute), line)?
         {
             return Ok(Some(dag));
         }
         // Numeric offset (Type 4 with compute)
-        let (i_reg, offset) = parse_ireg_and_offset(parts[0], parts[1], line)?;
+        let (i_reg, offset, post_modify) = parse_ireg_and_offset(parts[0], parts[1], line)?;
         let dreg = parse_dreg(mem_lhs, line)?;
         let i_field = if pm { i_reg.wrapping_sub(8) } else { i_reg };
         Ok(Some(Instruction::ComputeLoadStore {
@@ -2543,8 +3807,10 @@ fn try_parse_compound_mem(text: &str, line: u32) -> Result<Option<Instruction>> 
                 i_reg: i_field,
             },
             dreg,
-            offset: offset as i8,
+            offset: type4_offset(offset, line)?,
             cond: 31,
+            post_modify,
+            width: selinstr::encode::DagWidth::Normal,
         }))
     }
 }
@@ -2766,6 +4032,13 @@ fn extract_mem_inner(expr: &str, line: u32) -> Result<(bool, &str)> {
         line,
         msg: format!("missing ')' in memory expression: {expr}"),
     })?;
+    let suffix = rest[close + 1..].trim();
+    if !suffix.is_empty() {
+        return Err(Error::Parse {
+            line,
+            msg: format!("unexpected memory access suffix: {suffix}"),
+        });
+    }
     Ok((pm, &rest[..close]))
 }
 
@@ -2815,30 +4088,43 @@ fn try_parse_multifunction(text: &str, line: u32) -> Result<Option<ComputeOp>> {
             }
         }
     } else if commas.len() == 1 {
-        // Two-part without multiply: Ra = Rxa + Rya, Rs = Rxa - Rya
-        // (dual add/sub with no multiply — mul fields zeroed)
+        // Two-part without multiply: `Fn = Fx + Fy, Fs = Fx - Fy` is the
+        // ALU dual add/subtract (the reference assembler `f12 = f2 + f6 , f8 = f2 - f6` =
+        // 018f8c26). It used to become the multiplier form with zeroed
+        // multiply fields, which also ran `F0 = F0 * F4`. Only the float
+        // form has vendor vectors.
         let add_part = first_part;
         let sub_part = text[first_comma + 1..].trim();
-        if add_part.contains('+') && sub_part.contains('-') {
-            let fp = add_part.contains('F') && !add_part.contains("MRF");
-            if let Ok((alu_sel, ra, rxa, rya)) = parse_mf_alu_part(add_part, fp, line) {
-                if alu_sel == 0 {
-                    if let Some(sub_eq) = sub_part.find('=') {
-                        if let Ok(rs) = parse_dreg(sub_part[..sub_eq].trim(), line) {
-                            return Ok(Some(ComputeOp::Multi(MultiOp::MulDualAddSub {
-                                fp,
-                                rm: 0,
-                                ra,
-                                rs,
-                                rxm: 0,
-                                rym: 0,
-                                rxa,
-                                rya,
-                            })));
-                        }
-                    }
-                }
+        let side = |part: &str, op: &str| -> Option<(u16, u16, u16)> {
+            let (dst, rhs) = part.split_once('=')?;
+            let (x, y) = split_at_str(rhs.trim(), op)?;
+            let regs = [dst.trim(), x.trim(), y.trim()];
+            if !regs.iter().all(|r| r.starts_with('F')) {
+                return None;
             }
+            Some((
+                parse_dreg(regs[0], line).ok()?,
+                parse_dreg(regs[1], line).ok()?,
+                parse_dreg(regs[2], line).ok()?,
+            ))
+        };
+        if let (Some((rn, x1, y1)), Some((rs, x2, y2))) =
+            (side(add_part, " + "), side(sub_part, " - "))
+        {
+            if (x1, y1) != (x2, y2) {
+                return Err(Error::Parse {
+                    line,
+                    msg: format!(
+                        "dual add/subtract needs the same operands in both halves: `{text}`"
+                    ),
+                });
+            }
+            return Ok(Some(ComputeOp::Falu(FaluOp::DualAddSub {
+                rn,
+                rs,
+                rx: x1,
+                ry: y1,
+            })));
         }
     }
 
@@ -2952,23 +4238,62 @@ fn parse_mf_alu_part(text: &str, fp: bool, line: u32) -> Result<(u8, u16, u16, u
     let rhs = text[eq + 1..].trim();
     let ra = parse_dreg(dst, line)?;
 
-    // Check for (Rxa + Rya)/2 or (Rxa + Rya) / 2
-    let avg_end = if rhs.ends_with("/2") {
-        Some(2) // strip "/2"
-    } else if rhs.ends_with("/ 2") {
-        Some(3) // strip "/ 2"
-    } else {
-        None
-    };
-    if let Some(trim_len) = avg_end {
-        if rhs.starts_with('(') {
-            let inner = &rhs[1..rhs.len() - trim_len];
-            let inner = inner.trim().strip_suffix(')').unwrap_or(inner).trim();
+    // Check for (Rxa + Rya)/2, with the divisor written `2` or `0x2` and
+    // any spacing (the reference assembler accepts `( f10 + f12 ) / 0x2`).
+    let avg_inner = rhs
+        .rsplit_once('/')
+        .and_then(|(head, div)| (parse_number(div.trim()) == Some(2)).then_some(head.trim()));
+    if let Some(head) = avg_inner {
+        if let Some(inner) = head.strip_prefix('(').and_then(|h| h.strip_suffix(')')) {
+            let inner = inner.trim();
             if let Some((lhs_str, rhs_str)) = split_at_str(inner, " + ") {
                 let rxa = parse_dreg(lhs_str.trim(), line)?;
                 let rya = parse_dreg(rhs_str.trim(), line)?;
                 let (rxa_2, rya_2) = check_mf_alu_regs(rxa, rya, fp, line)?;
                 return Ok((2, ra, rxa_2, rya_2));
+            }
+        }
+    }
+
+    // Float-only ALU operations (the reference assembler multifunction opcodes 0x1a,
+    // 0x1d, 0x1e, 0x1f).
+    if fp {
+        let two = |inner: &str| -> Result<(u16, u16)> {
+            let (a, b) = inner.split_once(',').ok_or_else(|| Error::Parse {
+                line,
+                msg: format!("expected two operands in `{text}`"),
+            })?;
+            check_mf_alu_regs(
+                parse_dreg(a.trim(), line)?,
+                parse_dreg(b.trim(), line)?,
+                fp,
+                line,
+            )
+        };
+        let paren = |op: &str| {
+            rhs.strip_prefix(op)
+                .map(str::trim)
+                .and_then(|r| r.strip_prefix('('))
+                .and_then(|r| r.strip_suffix(')'))
+        };
+        if let Some(inner) = paren("MAX") {
+            let (rxa, rya) = two(inner)?;
+            return Ok((5, ra, rxa, rya));
+        }
+        if let Some(inner) = paren("MIN") {
+            let (rxa, rya) = two(inner)?;
+            return Ok((6, ra, rxa, rya));
+        }
+        if let Some(x) = rhs.strip_prefix("ABS ") {
+            let (rxa, _) = check_mf_alu_regs(parse_dreg(x.trim(), line)?, 12, fp, line)?;
+            return Ok((4, ra, rxa, 0));
+        }
+        if let Some(rest) = rhs.strip_prefix("FLOAT ") {
+            if let Some((x, y)) = split_at_str(rest, " BY ") {
+                let rxa = parse_dreg(x.trim(), line)?;
+                let rya = parse_dreg(y.trim(), line)?;
+                let (rxa_2, rya_2) = check_mf_alu_regs(rxa, rya, fp, line)?;
+                return Ok((3, ra, rxa_2, rya_2));
             }
         }
     }
@@ -3054,12 +4379,17 @@ fn parse_mf_dual_addsub(
             msg: "dual add/sub: second part must be addition".into(),
         });
     }
-    // sub part: Rs = Rxa - Rya
-    let sub_eq = sub_text.find('=').ok_or_else(|| Error::Parse {
-        line,
-        msg: format!("expected '=' in subtract part: {sub_text}"),
-    })?;
-    let rs = parse_dreg(sub_text[..sub_eq].trim(), line)?;
+    // sub part: Rs = Rxa - Rya, the add part's operands. Only its
+    // destination used to be read, so `f0 = f1 * f4, f12 = f11 + f12,
+    // r14 = r13` (the reference assembler 70fe87580c4c: multiply + add with a register
+    // transfer) became `f14 = f11 - f12`.
+    let (sub_sel, rs, rxs, rys) = parse_mf_alu_part(sub_text, fp, line)?;
+    if sub_sel != 1 || rxs != rxa || rys != rya {
+        return Err(Error::Parse {
+            line,
+            msg: format!("dual add/sub: third part must be the subtraction: {sub_text}"),
+        });
+    }
     Ok(ComputeOp::Multi(MultiOp::MulDualAddSub {
         fp,
         rm,
@@ -3087,7 +4417,9 @@ fn parse_compute_or_load(text: &str, line: u32) -> Result<Instruction> {
         // register names), so "R0 = R1 + R2" will not match here.
         if let Some(expr_val) = eval_const_expr(rhs) {
             if let Some(ureg) = ureg_code(lhs) {
-                let value = expr_val as u32;
+                // The reference assembler rejects `i0 = 0x100000000` and `b0 =
+                // -0x100000001`; selas truncated them.
+                let value = fit_data32(expr_val, "immediate", line)? as u32;
                 return Ok(Instruction::LoadImm { ureg, value });
             }
         }
@@ -3157,39 +4489,19 @@ fn parse_compute_or_load(text: &str, line: u32) -> Result<Instruction> {
         // Check for universal register transfer: "ureg1 = ureg2"
         if let Some(dst) = ureg_code(lhs) {
             if let Some(src) = ureg_code(rhs) {
-                // Both sides are uregs — this is a register transfer
-                // Avoid matching compute ops like R0 = R1 (which is PASS)
-                // Only use UregTransfer when at least one side is NOT a dreg (R/F)
-                let lhs_is_dreg = (lhs.starts_with('R') || lhs.starts_with('F'))
-                    && lhs[1..].chars().all(|c| c.is_ascii_digit())
-                    && dst <= 15;
-                let rhs_is_dreg = (rhs.starts_with('R') || rhs.starts_with('F'))
-                    && rhs[1..].chars().all(|c| c.is_ascii_digit())
-                    && src <= 15;
-                if !lhs_is_dreg || !rhs_is_dreg {
-                    return Ok(Instruction::UregTransfer {
-                        src_ureg: src,
-                        dst_ureg: dst,
-                        cond: 31,
-                        compute: None,
-                    });
+                // Both sides are uregs: a register transfer. The reference assembler
+                // encodes `r15=r0;` as Type 5 (703e07bf), which leaves
+                // ASTAT alone; it is not `R15 = PASS R0`, which sets the
+                // ALU flags. A float register on either side has no
+                // vendor vector, so it must be spelled out.
+                if is_float_reg(lhs) || is_float_reg(rhs) {
+                    return Err(float_copy_error(lhs, rhs, line));
                 }
-                // Both dregs: "R4 = R0" is shorthand for "R4 = PASS R0"
-                let is_float = lhs.starts_with('F');
-                let op = if is_float {
-                    ComputeOp::Falu(FaluOp::Pass {
-                        rn: dst & 0xF,
-                        rx: src & 0xF,
-                    })
-                } else {
-                    ComputeOp::Alu(AluOp::Pass {
-                        rn: dst & 0xF,
-                        rx: src & 0xF,
-                    })
-                };
-                return Ok(Instruction::Compute {
+                return Ok(Instruction::UregTransfer {
+                    src_ureg: src,
+                    dst_ureg: dst,
                     cond: 31,
-                    compute: op,
+                    compute: None,
                 });
             }
         }
@@ -3208,6 +4520,82 @@ fn parse_compute_or_load(text: &str, line: u32) -> Result<Instruction> {
 /// Try to parse an immediate shift: Rn = LSHIFT/ASHIFT Rx BY <imm>,
 /// Rn = BSET/BCLR/BTGL Rx BY <imm>, or BTST Rx BY <imm>.
 /// Returns None if the BY operand is a register.
+/// SHARC+ bit FIFO: `Rn = BITEXT imm12`, `BITDEP Rx BY imm12`, `BFFWRP =
+/// imm7`, `Rn = BFFWRP`, `BFFWRP = Ry`. The reference assembler: `r0 = bitext 0x20` =
+/// 023e00142000, `bitdep r2 by 0x800` = 023e401d0002, `bffwrp = 0x10` =
+/// 023e001f1000, `r1 = bffwrp` = 01a70100, `bffwrp = r1` = 01a7c001; it
+/// rejects `bitext 0x1000`, `bitext -0x1` and `bffwrp = 0x80`. selas
+/// loaded a symbol named `BITEXT 0x20` or `BFFWRP` instead.
+fn try_parse_bit_fifo(text: &str, line: u32) -> Result<Option<Instruction>> {
+    let imm = |s: &str, max: i64| -> Result<u16> {
+        match parse_signed_number(s) {
+            Some(v) if (0..=max).contains(&v) => Ok(v as u16),
+            _ => Err(Error::Parse {
+                line,
+                msg: format!("bit FIFO immediate {s} is out of range (0-{max:#x})"),
+            }),
+        }
+    };
+    let fifo = |sub_op: u8, value: u16, rn: u16, rx: u16| Instruction::ImmShift {
+        shift_type: 1,
+        sub_op,
+        imm: (value & 0xFF) as u8,
+        rn,
+        rx,
+        data_hi: (value >> 8) as u8,
+        cond: 31,
+    };
+    let text = text.trim();
+    if let Some(rest) = text.strip_prefix("BITDEP ") {
+        let (rx, by) = split_at_str(rest, " BY ").ok_or_else(|| Error::Parse {
+            line,
+            msg: format!("expected 'BY' in {text}"),
+        })?;
+        let rx = parse_dreg(rx.trim(), line)?;
+        return Ok(Some(fifo(0xD, imm(by.trim(), 0xFFF)?, 0, rx)));
+    }
+    let Some((lhs, rhs)) = text.split_once('=') else {
+        return Ok(None);
+    };
+    let (lhs, rhs) = (lhs.trim(), rhs.trim());
+    if lhs == "BFFWRP" {
+        if let Ok(ry) = parse_dreg(rhs, line) {
+            return Ok(Some(Instruction::Compute {
+                cond: 31,
+                compute: ComputeOp::Shift(ShiftOp::BffwrpWrite { ry }),
+            }));
+        }
+        return Ok(Some(fifo(0xF, imm(rhs, 0x7F)?, 0, 0)));
+    }
+    if rhs == "BFFWRP" {
+        let rn = parse_dreg(lhs, line)?;
+        return Ok(Some(Instruction::Compute {
+            cond: 31,
+            compute: ComputeOp::Shift(ShiftOp::BffwrpRead { rn }),
+        }));
+    }
+    if let Some(value) = rhs.strip_prefix("BITEXT ") {
+        let rn = parse_dreg(lhs, line)?;
+        return Ok(Some(fifo(4, imm(value.trim(), 0xFFF)?, rn, 0)));
+    }
+    Ok(None)
+}
+
+/// `Rn = Rn OR LSHIFT|ASHIFT|FDEP|FEXT ...`: the OR operand must be the
+/// destination. The reference assembler rejects all 1,428 oracle rows like `r0 = r1 or
+/// lshift r0 by 16`; selas ignored the operand and OR-ed into Rn.
+fn check_or_operand(rn: u16, rhs: &str, line: u32) -> Result<()> {
+    if let Some((operand, _)) = split_at_str(rhs, " OR ") {
+        if parse_dreg(operand.trim(), line).ok() != Some(rn) {
+            return Err(Error::Parse {
+                line,
+                msg: format!("the OR operand must be the destination register: {rhs}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn try_parse_imm_shift(text: &str, line: u32) -> Result<Option<Instruction>> {
     // Check for FEXT/FDEP with pos:len notation first
     if (text.contains("FEXT") || text.contains("FDEP"))
@@ -3229,6 +4617,12 @@ fn try_parse_imm_shift(text: &str, line: u32) -> Result<Option<Instruction>> {
             Err(_) => return Ok(None),
         };
         if let Some(imm_val) = parse_signed_number(by_str.trim()) {
+            if !(0..=31).contains(&imm_val) {
+                return Err(Error::Parse {
+                    line,
+                    msg: format!("bit number {} is out of range", by_str.trim()),
+                });
+            }
             return Ok(Some(Instruction::ImmShift {
                 shift_type: 3,
                 sub_op: 3,
@@ -3242,17 +4636,19 @@ fn try_parse_imm_shift(text: &str, line: u32) -> Result<Option<Instruction>> {
         return Ok(None);
     }
 
-    // Check for LSHIFT, ASHIFT, ROT, BSET, BCLR, BTGL with BY. Also the OR LSHIFT / OR ASHIFT immediate forms.
-    // (shift_type, sub_op) is the PRM Table 17-9 shiftimm opcode split at bit 4.
+    // Check for LSHIFT, ASHIFT, BSET, BCLR, BTGL with BY
+    // Also handle OR LSHIFT / OR ASHIFT immediate forms
     let (shift_type, sub_op, keyword) = if text.contains("OR LSHIFT") && text.contains(" BY ") {
-        (0u8, 0x8u8, "LSHIFT")
+        (0u8, 4u8, "LSHIFT") // sub_op=4 for OR LSHIFT
     } else if text.contains("OR ASHIFT") && text.contains(" BY ") {
-        (0u8, 0x9u8, "ASHIFT")
+        (2u8, 4u8, "ASHIFT") // sub_op=4 for OR ASHIFT
     } else if text.contains("LSHIFT") && text.contains(" BY ") {
         (0u8, 0u8, "LSHIFT")
     } else if text.contains("ASHIFT") && text.contains(" BY ") {
-        (0u8, 1u8, "ASHIFT")
+        (2u8, 0u8, "ASHIFT")
     } else if text.contains("ROT ") && text.contains(" BY ") {
+        // SHIFTOP 0x02 (register ROT 0x08 >> 2): `r0 = rot r0 by 5` =
+        // 023e00020500, `r0 = rot r0 by -0x1` = 023e7802ff00.
         (0u8, 2u8, "ROT")
     } else if text.contains("BSET") && text.contains(" BY ") {
         (3u8, 0u8, "BSET")
@@ -3277,6 +4673,9 @@ fn try_parse_imm_shift(text: &str, line: u32) -> Result<Option<Instruction>> {
 
     // Extract Rx and BY operand
     let rhs = text[eq + 1..].trim();
+    if sub_op == 4 {
+        check_or_operand(rn, rhs, line)?;
+    }
 
     let kw_pos = match rhs.find(keyword) {
         Some(p) => p,
@@ -3295,6 +4694,31 @@ fn try_parse_imm_shift(text: &str, line: u32) -> Result<Option<Instruction>> {
 
     // Try to parse as immediate
     if let Some(imm_val) = parse_signed_number(by_trimmed) {
+        // A shift count is a signed 8-bit field (bits 11:8 only carry its
+        // sign). The reference assembler reads 32-bit values as signed (`by 0xffffffff` =
+        // -1) and rejects `lshift r1 by 0x100 , r0 = dm(i5, m4)`; selas used
+        // to truncate 0x100 to 0.
+        // BSET/BCLR/BTGL bit numbers are 0-31 (the reference assembler rejects 0x20, 0x100
+        // and -0x1).
+        if shift_type == 3 && !(0..=31).contains(&imm_val) {
+            return Err(Error::Parse {
+                line,
+                msg: format!("bit number {by_trimmed} is out of range"),
+            });
+        }
+        if shift_type != 3 {
+            let count = if (0x8000_0000..=0xFFFF_FFFF).contains(&imm_val) {
+                imm_val - (1 << 32)
+            } else {
+                imm_val
+            };
+            if !(-128..=127).contains(&count) {
+                return Err(Error::Parse {
+                    line,
+                    msg: format!("shift count {by_trimmed} is out of range"),
+                });
+            }
+        }
         return Ok(Some(Instruction::ImmShift {
             shift_type,
             sub_op,
@@ -3329,14 +4753,22 @@ fn try_parse_imm_fext_fields(text: &str, line: u32) -> Result<Option<ImmFextFiel
     let dst = text[..eq].trim();
     let rhs = text[eq + 1..].trim();
 
-    let (keyword, or_form) = if rhs.contains("OR FEXT") {
-        ("FEXT", true)
+    // sub_op = low nibble of the immediate opcode (`type6_shift_op`).
+    let no_vector = |form: &str| Error::Parse {
+        line,
+        msg: format!("{form} by an immediate has no reference vector; use the register form"),
+    };
+    let (keyword, sub_op) = if rhs.contains("OR FEXT") {
+        return Err(Error::Parse {
+            line,
+            msg: format!("there is no OR FEXT: {rhs}"),
+        });
     } else if rhs.contains("OR FDEP") {
-        ("FDEP", true)
+        ("FDEP", 9u8)
     } else if rhs.contains("FEXT") {
-        ("FEXT", false)
+        ("FEXT", 0u8)
     } else if rhs.contains("FDEP") {
-        ("FDEP", false)
+        return Err(no_vector("FDEP"));
     } else {
         return Ok(None);
     };
@@ -3345,6 +4777,9 @@ fn try_parse_imm_fext_fields(text: &str, line: u32) -> Result<Option<ImmFextFiel
         Ok(r) => r,
         Err(_) => return Ok(None),
     };
+    if sub_op == 9 {
+        check_or_operand(rn, rhs, line)?;
+    }
 
     let kw_pos = match rhs.find(keyword) {
         Some(p) => p,
@@ -3367,34 +4802,44 @@ fn try_parse_imm_fext_fields(text: &str, line: u32) -> Result<Option<ImmFextFiel
     };
     let pos_str = by_trimmed[..colon].trim();
     let mut len_str = by_trimmed[colon + 1..].trim();
-    // Handle (SE) suffix: sign-extending FEXT → sub_op=2
-    let se_suffix = len_str.ends_with("(SE)");
-    if se_suffix {
-        len_str = len_str.strip_suffix("(SE)").unwrap().trim();
-    }
-    let pos = match parse_number(pos_str) {
-        Some(v) => v as u8,
-        None => return Ok(None),
-    };
-    let len = match parse_number(len_str) {
-        Some(v) => v as u8,
-        None => return Ok(None),
-    };
-    // PRM Table 17-9 shiftimm opcodes (low nibble; high nibble is 1): FEXT 0x10, FDEP 0x11, FEXT (SE) 0x12, FDEP (SE) 0x13,
-    // OR FDEP 0x1B, OR FDEP (SE) 0x1D. There is no OR FEXT form.
-    let sub_op = match (keyword, or_form, se_suffix) {
-        ("FEXT", false, false) => 0x0,
-        ("FDEP", false, false) => 0x1,
-        ("FEXT", false, true) => 0x2,
-        ("FDEP", false, true) => 0x3,
-        ("FDEP", true, false) => 0xB,
-        ("FDEP", true, true) => 0xD,
-        _ => {
-            return Err(Error::Parse {
-                line,
-                msg: format!("no immediate form of: {text}"),
-            });
+    // Handle (SE) suffix: sign-extending FEXT → sub_op=2. The reference assembler writes
+    // it spaced as often as not: `r1 = fext r4 by 0x10:0x8 ( se )`.
+    let mut se_suffix = false;
+    if let Some(open) = len_str.rfind('(') {
+        let packed: String = len_str[open..]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if packed == "(SE)" {
+            se_suffix = true;
+            len_str = len_str[..open].trim();
         }
+    }
+    // Position and length are 6-bit fields; the reference assembler rejects -0x1, 0x100
+    // and 0x100000 (selas truncated them).
+    let field = |s: &str| -> Result<Option<u8>> {
+        match parse_signed_number(s) {
+            Some(v) if (0..=63).contains(&v) => Ok(Some(v as u8)),
+            Some(_) => Err(Error::Parse {
+                line,
+                msg: format!("bit field {by_trimmed} is out of range (0-63)"),
+            }),
+            None => Ok(None),
+        }
+    };
+    let pos = match field(pos_str)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let len = match field(len_str)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    // (SE): FEXT (SE) is 0x12; OR FDEP (SE) has no vector.
+    let sub_op = match (se_suffix, sub_op) {
+        (false, op) => op,
+        (true, 0) => 2,
+        (true, _) => return Err(no_vector("OR FDEP (SE)")),
     };
 
     let imm = (pos & 0x3F) | ((len & 0x3) << 6);
@@ -3579,28 +5024,39 @@ fn parse_mr_op(text: &str, line: u32) -> Result<ComputeOp> {
             };
         }
 
-        // MRF = TRNC MRF / MRB = TRNC MRB
-        if rhs == "TRNC MRF" {
-            return Ok(ComputeOp::Mul(MulOp::TrncMrf));
+        // `MRF|MRB = SAT|RND MRF|MRB [(mod)]`: the reference assembler opcodes
+        // (MEASURED), unsuffixed = (SF). `MRx = TRNC MRx` is not
+        // reference-assembler syntax; its old opcodes 0x18/0x1A are
+        // `Rn = RND MRF|MRB (UF)`, so it is refused.
+        let packed: String = rhs.chars().filter(|c| !c.is_whitespace()).collect();
+        let opcode = match (lhs, packed.as_str()) {
+            ("MRF", "SATMRF(UI)") => Some(0x04),
+            ("MRF", "SATMRF(SI)") => Some(0x05),
+            ("MRF", "SATMRF(UF)") => Some(0x0C),
+            ("MRF", "SATMRF" | "SATMRF(SF)") => Some(0x0D),
+            ("MRB", "SATMRB(UI)") => Some(0x06),
+            ("MRB", "SATMRB(SI)") => Some(0x07),
+            ("MRB", "SATMRB(UF)") => Some(0x0E),
+            ("MRB", "SATMRB" | "SATMRB(SF)") => Some(0x0F),
+            ("MRF", "RNDMRF(UF)") => Some(0x1C),
+            ("MRF", "RNDMRF" | "RNDMRF(SF)") => Some(0x1D),
+            ("MRB", "RNDMRB(UF)") => Some(0x1E),
+            ("MRB", "RNDMRB" | "RNDMRB(SF)") => Some(0x1F),
+            _ => None,
+        };
+        if let Some(opcode) = opcode {
+            return Ok(ComputeOp::Mul(MulOp::MrToReg { opcode, rn: 0 }));
         }
-        if rhs == "TRNC MRB" {
-            return Ok(ComputeOp::Mul(MulOp::TrncMrb));
+        if packed.starts_with("TRNC") {
+            return Err(Error::Parse {
+                line,
+                msg: format!("{lhs} = {rhs} is not reference-assembler syntax"),
+            });
         }
 
-        // MRF = MRF + Rx * Ry (SSF) — accumulate must precede plain multiply
-        // since the accumulate form also contains '*'.
-        if rhs.starts_with("MRF + ") || rhs.starts_with("MRB + ") {
-            let mul_part = &rhs[6..];
-            return parse_mr_mul_acc_sub(lhs, mul_part, true, line);
-        }
-        if rhs.starts_with("MRF - ") || rhs.starts_with("MRB - ") {
-            let mul_part = &rhs[6..];
-            return parse_mr_mul_acc_sub(lhs, mul_part, false, line);
-        }
-
-        // MRF = Rx * Ry (SSF) etc.
+        // MRF = Rx * Ry (SSF), MRF = MRF + Rx * Ry (SSI), etc.
         if rhs.contains('*') {
-            return parse_mr_mul(lhs, rhs, line);
+            return parse_fixed_mul(lhs, rhs, line);
         }
     }
 
@@ -3610,61 +5066,95 @@ fn parse_mr_op(text: &str, line: u32) -> Result<ComputeOp> {
     })
 }
 
-fn parse_mr_mul(lhs: &str, rhs: &str, line: u32) -> Result<ComputeOp> {
-    // "Rx * Ry (SSF)" or "Rx * Ry (UUF)"
-    let star = rhs.find('*').unwrap();
-    let rx_str = rhs[..star].trim();
-    let after_star = rhs[star + 1..].trim();
-    // Remove optional "(SSF)" or "(UUF)" suffix
-    let ry_end = after_star.find('(').unwrap_or(after_star.len());
-    let ry_str = after_star[..ry_end].trim();
-    let modifier = if ry_end < after_star.len() {
-        after_star[ry_end..].trim()
-    } else {
-        ""
-    };
-
-    let rx = parse_dreg(rx_str, line)?;
-    let ry = parse_dreg(ry_str, line)?;
-    let is_b = lhs == "MRB";
-
-    if modifier.contains("UUI") {
-        return Ok(ComputeOp::Mul(MulOp::MrfMulUui { rx, ry }));
-    }
-    if modifier.contains("UUF") {
-        return Ok(ComputeOp::Mul(MulOp::MrfMulUuf { rx, ry }));
-    }
-    if modifier.contains("SSI") && !is_b {
-        return Ok(ComputeOp::Mul(MulOp::MrfMulSsi { rx, ry }));
-    }
-
-    if is_b {
-        Ok(ComputeOp::Mul(MulOp::MrbMulSsf { rx, ry }))
-    } else {
-        Ok(ComputeOp::Mul(MulOp::MrfMulSsf { rx, ry }))
-    }
-}
-
-fn parse_mr_mul_acc_sub(lhs: &str, mul_expr: &str, is_acc: bool, line: u32) -> Result<ComputeOp> {
-    let star = mul_expr.find('*').ok_or_else(|| Error::Parse {
+/// A fixed-point multiply `dst = [MRF|MRB +|-] Rx * Ry [(mod2)]`, `dst`
+/// being Rn, MRF or MRB. The opcode follows the `ddyx f??r` template in
+/// `encode_mul`; mod2 names Rx then Ry signedness, then I/F and an
+/// optional R (vendor `r0 = r0 * r1 (sui)` = opcode 0x50: Rx signed).
+/// selas used to drop every suffix it had no variant for and encode SSF.
+fn parse_fixed_mul(lhs: &str, rhs: &str, line: u32) -> Result<ComputeOp> {
+    let err = |msg: &str| Error::Parse {
         line,
-        msg: "expected '*' in MR accumulate".into(),
-    })?;
-    let rx_str = mul_expr[..star].trim();
-    let after_star = mul_expr[star + 1..].trim();
-    let ry_end = after_star.find('(').unwrap_or(after_star.len());
-    let ry_str = after_star[..ry_end].trim();
-
-    let rx = parse_dreg(rx_str, line)?;
-    let ry = parse_dreg(ry_str, line)?;
-    let is_b = lhs == "MRB";
-
-    match (is_b, is_acc) {
-        (false, true) => Ok(ComputeOp::Mul(MulOp::MrfMacSsf { rx, ry })),
-        (true, true) => Ok(ComputeOp::Mul(MulOp::MrbMacSsf { rx, ry })),
-        (false, false) => Ok(ComputeOp::Mul(MulOp::MrfMsubSsf { rx, ry })),
-        (true, false) => Ok(ComputeOp::Mul(MulOp::MrbMsubSsf { rx, ry })),
-    }
+        msg: format!("{msg}: {lhs} = {rhs}"),
+    };
+    let accumulate = |mr: &str| {
+        let rest = rhs.strip_prefix(mr)?.trim_start();
+        if let Some(p) = rest.strip_prefix('+') {
+            Some((0x80u8, p))
+        } else {
+            rest.strip_prefix('-').map(|p| (0xC0u8, p))
+        }
+    };
+    let (acc_b, top, product) = if let Some((top, p)) = accumulate("MRF") {
+        (Some(false), top, p)
+    } else if let Some((top, p)) = accumulate("MRB") {
+        (Some(true), top, p)
+    } else {
+        (None, 0x40, rhs)
+    };
+    let (rn, dd) = match (lhs, acc_b) {
+        ("MRF", None | Some(false)) => (0, 0b10),
+        ("MRB", None | Some(true)) => (0, 0b11),
+        ("MRF" | "MRB", Some(_)) => return Err(err("the accumulator must be the destination")),
+        (_, None) => (parse_dreg(lhs, line)?, 0b00),
+        (_, Some(b)) => (parse_dreg(lhs, line)?, u8::from(b)),
+    };
+    let (factors, modifier) = match product.find('(') {
+        Some(p) => (&product[..p], &product[p..]),
+        None => (product, ""),
+    };
+    let (rx_str, ry_str) = factors
+        .split_once('*')
+        .ok_or_else(|| err("expected '*' in multiply"))?;
+    let rx = parse_dreg(rx_str.trim(), line)?;
+    let ry = parse_dreg(ry_str.trim(), line)?;
+    let mod2: String = modifier
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '(' && *c != ')')
+        .collect();
+    // No suffix: selas's long-standing default.
+    let mod2 = if mod2.is_empty() {
+        "SSF"
+    } else {
+        mod2.as_str()
+    };
+    let signed = |c: u8| match c {
+        b'S' => Some(1u8),
+        b'U' => Some(0),
+        _ => None,
+    };
+    let m = mod2.as_bytes();
+    let bits = match m {
+        [x, y, f, rest @ ..] if rest.is_empty() || (rest == b"R" && *f == b'F') => {
+            let frac = match f {
+                b'F' => Some(1u8),
+                b'I' => Some(0),
+                _ => None,
+            };
+            match (signed(*x), signed(*y), frac) {
+                (Some(x), Some(y), Some(frac)) => {
+                    (y << 5) | (x << 4) | (frac << 3) | u8::from(!rest.is_empty())
+                }
+                _ => return Err(err("unknown multiplier mode")),
+            }
+        }
+        _ => return Err(err("unknown multiplier mode")),
+    };
+    let opcode = top | bits | (dd << 1);
+    Ok(ComputeOp::Mul(match opcode {
+        0x70 => MulOp::MulSsi { rn, rx, ry },
+        0x78 => MulOp::MulSsf { rn, rx, ry },
+        0x74 => MulOp::MrfMulSsi { rx, ry },
+        0x7C => MulOp::MrfMulSsf { rx, ry },
+        0x4C => MulOp::MrfMulUuf { rx, ry },
+        0x44 => MulOp::MrfMulUui { rx, ry },
+        0x7E => MulOp::MrbMulSsf { rx, ry },
+        0xB8 => MulOp::MacSsf { rn, rx, ry },
+        0xBC => MulOp::MrfMacSsf { rx, ry },
+        0xBE => MulOp::MrbMacSsf { rx, ry },
+        0xFC => MulOp::MrfMsubSsf { rx, ry },
+        0xFE => MulOp::MrbMsubSsf { rx, ry },
+        _ => MulOp::FixedMul { opcode, rn, rx, ry },
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -3740,12 +5230,25 @@ fn parse_assign(dst: &str, rhs: &str, line: u32) -> Result<ComputeOp> {
         return Ok(ComputeOp::Shift(ShiftOp::Lefto { rn, rx }));
     }
 
-    // FPACK / FUNPACK
+    // FPACK / FUNPACK: `Rn = FPACK Fx`, `Fn = FUNPACK Rx`; the reference assembler rejects
+    // `r4 = fpack r0` and `r4 = funpack r0`.
     if let Some(rest) = rhs.strip_prefix("FPACK ") {
+        if !rest.trim().starts_with('F') {
+            return Err(Error::Parse {
+                line,
+                msg: format!("FPACK takes a float source, `Rn = FPACK Fx`: {dst} = {rhs}"),
+            });
+        }
         let rx = parse_dreg(rest.trim(), line)?;
         return Ok(ComputeOp::Shift(ShiftOp::Fpack { rn, rx }));
     }
     if let Some(rest) = rhs.strip_prefix("FUNPACK ") {
+        if !is_float {
+            return Err(Error::Parse {
+                line,
+                msg: format!("FUNPACK writes a float, `Fn = FUNPACK Rx`: {dst} = {rhs}"),
+            });
+        }
         let rx = parse_dreg(rest.trim(), line)?;
         return Ok(ComputeOp::Shift(ShiftOp::Funpack { rn, rx }));
     }
@@ -3763,7 +5266,37 @@ fn parse_assign(dst: &str, rhs: &str, line: u32) -> Result<ComputeOp> {
 
     // Multiply: Rn = Rx * Ry (SSF), Fn = Fx * Fy
     if rhs.contains('*') {
-        return parse_reg_mul(rn, rhs, is_float, line);
+        return parse_reg_mul(dst, rn, rhs, is_float, line);
+    }
+
+    // `Rn = SAT MRF|MRB (SI|SF)`, `Rn = RND MRF|MRB (SF)` (vendor opcodes
+    // in MulOp::MrToReg).
+    let packed_rhs: String = rhs.chars().filter(|c| !c.is_whitespace()).collect();
+    let mr_opcode = match packed_rhs.as_str() {
+        // (MEASURED): (UI) 0x00/0x02, (UF) 0x08/0x0A;
+        // RND unsuffixed = (SF), (UF) 0x18/0x1A.
+        "SATMRF(UI)" => Some(0x00),
+        "SATMRF(SI)" => Some(0x01),
+        "SATMRB(UI)" => Some(0x02),
+        "SATMRB(SI)" => Some(0x03),
+        "SATMRF(UF)" => Some(0x08),
+        "SATMRF(SF)" => Some(0x09),
+        "SATMRB(UF)" => Some(0x0A),
+        "SATMRB(SF)" => Some(0x0B),
+        "RNDMRF(UF)" => Some(0x18),
+        "RNDMRF" | "RNDMRF(SF)" => Some(0x19),
+        "RNDMRB(UF)" => Some(0x1A),
+        "RNDMRB" | "RNDMRB(SF)" => Some(0x1B),
+        _ => None,
+    };
+    if let Some(opcode) = mr_opcode {
+        if is_float {
+            return Err(Error::Parse {
+                line,
+                msg: format!("{dst} = {rhs} needs an R register"),
+            });
+        }
+        return Ok(ComputeOp::Mul(MulOp::MrToReg { opcode, rn }));
     }
 
     // SAT MRF / SAT MRB
@@ -3774,30 +5307,14 @@ fn parse_assign(dst: &str, rhs: &str, line: u32) -> Result<ComputeOp> {
         return Ok(ComputeOp::Mul(MulOp::SatMrb { rn }));
     }
 
-    // TRNC MRF / TRNC MRB
-    if rhs == "TRNC MRF" {
-        return Ok(ComputeOp::Mul(MulOp::TrncMrfReg { rn }));
-    }
-    if rhs == "TRNC MRB" {
-        return Ok(ComputeOp::Mul(MulOp::TrncMrbReg { rn }));
-    }
-
-    // MRF + Rx * Ry (SSF)
-    if rhs.starts_with("MRF + ") || rhs.starts_with("MRB + ") {
-        let is_b = rhs.starts_with("MRB");
-        let mul_part = &rhs[6..];
-        let star = mul_part.find('*').ok_or_else(|| Error::Parse {
+    // `Rn = TRNC MRF|MRB` is not reference-assembler syntax,
+    // and its old opcodes 0x1C/0x1E are `MRF|MRB = RND MRF|MRB
+    // (UF)`: refuse it.
+    if rhs == "TRNC MRF" || rhs == "TRNC MRB" {
+        return Err(Error::Parse {
             line,
-            msg: "expected '*' in accumulate multiply".into(),
-        })?;
-        let rx_str = mul_part[..star].trim();
-        let after_star = mul_part[star + 1..].trim();
-        let ry_end = after_star.find('(').unwrap_or(after_star.len());
-        let ry_str = after_star[..ry_end].trim();
-        let rx = parse_dreg(rx_str, line)?;
-        let ry = parse_dreg(ry_str, line)?;
-        let _ = is_b; // MRF vs MRB distinction handled by encoder
-        return Ok(ComputeOp::Mul(MulOp::MacSsf { rn, rx, ry }));
+            msg: format!("{dst} = {rhs} is not reference-assembler syntax"),
+        });
     }
 
     // Int/float conversion: FIX, FLOAT, TRUNC (mixed register types)
@@ -3839,6 +5356,14 @@ fn parse_assign(dst: &str, rhs: &str, line: u32) -> Result<ComputeOp> {
         let rx = parse_dreg(rest.trim(), line)?;
         return Ok(ComputeOp::Falu(FaluOp::Rsqrts { rn, rx }));
     }
+    // `Rn = LOGB Fx`, `Rn = MANT Fx`: fixed-point results; the reference assembler rejects
+    // `f4 = logb f0` and `f4 = mant f0`.
+    if (rhs.starts_with("LOGB ") || rhs.starts_with("MANT ")) && is_float {
+        return Err(Error::Parse {
+            line,
+            msg: format!("{} writes a fixed-point register: {dst} = {rhs}", &rhs[..4]),
+        });
+    }
     if let Some(rest) = rhs.strip_prefix("LOGB ") {
         let rx = parse_dreg(rest.trim(), line)?;
         return Ok(ComputeOp::Falu(FaluOp::Logb { rn, rx }));
@@ -3871,26 +5396,35 @@ fn parse_assign(dst: &str, rhs: &str, line: u32) -> Result<ComputeOp> {
     // Single operand with CI, +1, -1 (check before general add/sub)
     // Only match when the remaining prefix is a plain register, otherwise
     // fall through to binary operators (e.g. "Rx - Ry + CI - 1" is SubCi).
-    if rhs.ends_with("+ CI - 1") {
-        let rx_str = rhs.strip_suffix("+ CI - 1").unwrap().trim();
+    // The reference assembler takes the 1 as `1` or `0x1`, spaced or not (`r0 = r9-0x1`,
+    // `r0 = r11 -0x1 , s0 = r0` = 703e2802a0b0); selas needed `- 1`.
+    let compact: String = rhs.chars().filter(|c| !c.is_whitespace()).collect();
+    let compact = match compact.strip_suffix("0X1") {
+        Some(head) if head.ends_with(['+', '-']) => format!("{head}1"),
+        _ => compact,
+    };
+    if let Some(rx_str) = compact.strip_suffix("+CI-1") {
         if let Ok(rx) = parse_dreg(rx_str, line) {
             return Ok(ComputeOp::Alu(AluOp::PassCiMinus1 { rn, rx }));
         }
+        // Rx - Ry + CI - 1
+        if let Some((x, y)) = rx_str.split_once('-') {
+            if let (Ok(rx), Ok(ry)) = (parse_dreg(x, line), parse_dreg(y, line)) {
+                return Ok(ComputeOp::Alu(AluOp::SubCi { rn, rx, ry }));
+            }
+        }
     }
-    if rhs.ends_with("+ CI") {
-        let rx_str = rhs.strip_suffix("+ CI").unwrap().trim();
+    if let Some(rx_str) = compact.strip_suffix("+CI") {
         if let Ok(rx) = parse_dreg(rx_str, line) {
             return Ok(ComputeOp::Alu(AluOp::PassCi { rn, rx }));
         }
     }
-    if rhs.ends_with("+ 1") {
-        let rx_str = rhs.strip_suffix("+ 1").unwrap().trim();
+    if let Some(rx_str) = compact.strip_suffix("+1") {
         if let Ok(rx) = parse_dreg(rx_str, line) {
             return Ok(ComputeOp::Alu(AluOp::Inc { rn, rx }));
         }
     }
-    if rhs.ends_with("- 1") {
-        let rx_str = rhs.strip_suffix("- 1").unwrap().trim();
+    if let Some(rx_str) = compact.strip_suffix("-1") {
         if let Ok(rx) = parse_dreg(rx_str, line) {
             return Ok(ComputeOp::Alu(AluOp::Dec { rn, rx }));
         }
@@ -3909,13 +5443,9 @@ fn parse_assign(dst: &str, rhs: &str, line: u32) -> Result<ComputeOp> {
         } else {
             rest
         };
-        let rx = if let Ok(r) = parse_dreg(inner, line) {
-            r
-        } else if let Some(pos) = inner.find([' ', '-', '+']) {
-            parse_dreg(inner[..pos].trim(), line)?
-        } else {
-            parse_dreg(inner, line)?
-        };
+        // The fixed-point ALU has only `Rn = ABS Rx`; `ABS (R1 - R2)` used
+        // to encode ABS R1.
+        let rx = parse_dreg(inner, line)?;
         return Ok(ComputeOp::Alu(AluOp::Abs { rn, rx }));
     }
     if let Some(rest) = rhs.strip_prefix("PASS ") {
@@ -4023,17 +5553,31 @@ fn parse_float_unary(rn: u16, rhs: &str, line: u32) -> Result<ComputeOp> {
         } else {
             rest
         };
-        // Try parsing as a single register first; if not, it's an
-        // expression like "F1 - F2" — encode ABS of the first register
-        // (sufficient for P1G; P1 will need a two-instruction sequence).
-        let rx = if let Ok(r) = parse_dreg(inner, line) {
-            r
-        } else if let Some(space_or_minus) = inner.find([' ', '-', '+']) {
-            parse_dreg(inner[..space_or_minus].trim(), line)?
-        } else {
-            parse_dreg(inner, line)?
+        // `ABS (Fx + Fy)` and `ABS (Fx - Fy)` are ALU ops of their own
+        // (the reference assembler `f0 = abs(f0 + f1)` = 01891001, `f0 = abs(f0 - f1)` =
+        // 01892001); selas encoded ABS of the first register.
+        if let Ok(rx) = parse_dreg(inner, line) {
+            return Ok(ComputeOp::Falu(FaluOp::Abs { rn, rx }));
+        }
+        let operands = |op: char| -> Result<Option<(u16, u16)>> {
+            match inner.split_once(op) {
+                Some((x, y)) => Ok(Some((
+                    parse_dreg(x.trim(), line)?,
+                    parse_dreg(y.trim(), line)?,
+                ))),
+                None => Ok(None),
+            }
         };
-        return Ok(ComputeOp::Falu(FaluOp::Abs { rn, rx }));
+        if let Some((rx, ry)) = operands('+')? {
+            return Ok(ComputeOp::Falu(FaluOp::AbsAdd { rn, rx, ry }));
+        }
+        if let Some((rx, ry)) = operands('-')? {
+            return Ok(ComputeOp::Falu(FaluOp::AbsSub { rn, rx, ry }));
+        }
+        return Err(Error::Parse {
+            line,
+            msg: format!("unrecognized ABS operand: {inner}"),
+        });
     }
 
     // Binary: Fn = Fx + Fy, Fn = Fx - Fy
@@ -4139,11 +5683,12 @@ fn parse_float_unary(rn: u16, rhs: &str, line: u32) -> Result<ComputeOp> {
         }
     }
 
-    // MIN/MAX/CLIP
-    if rhs.starts_with("MIN(") {
+    // MIN/MAX/CLIP (the reference assembler writes `f10 = max ( f2 , f0 )` spaced; the
+    // float path took only `MAX(`)
+    if rhs.starts_with("MIN(") || rhs.starts_with("MIN (") {
         return parse_min_max_clip(rn, rhs, "MIN", true, line);
     }
-    if rhs.starts_with("MAX(") {
+    if rhs.starts_with("MAX(") || rhs.starts_with("MAX (") {
         return parse_min_max_clip(rn, rhs, "MAX", true, line);
     }
     if rhs.starts_with("CLIP ") {
@@ -4261,6 +5806,7 @@ fn parse_shift_op(
 
 fn parse_or_shift(rn: u16, rhs: &str, shift_kind: &str, line: u32) -> Result<ComputeOp> {
     // "Rn OR LSHIFT Rx BY Ry"
+    check_or_operand(rn, rhs, line)?;
     let kw = format!("OR {shift_kind}");
     let start = rhs.find(&kw).unwrap() + kw.len();
     let rest = rhs[start..].trim();
@@ -4282,6 +5828,7 @@ fn parse_or_shift(rn: u16, rhs: &str, shift_kind: &str, line: u32) -> Result<Com
 }
 
 fn parse_or_fext_fdep(rn: u16, rhs: &str, kind: &str, line: u32) -> Result<ComputeOp> {
+    check_or_operand(rn, rhs, line)?;
     let kw = format!("OR {kind}");
     let start = rhs.find(&kw).unwrap() + kw.len();
     let rest = rhs[start..].trim();
@@ -4343,30 +5890,17 @@ fn parse_fext_fdep(rn: u16, rest: &str, kind: &str, line: u32) -> Result<Compute
     }
 }
 
-fn parse_reg_mul(rn: u16, rhs: &str, is_float: bool, line: u32) -> Result<ComputeOp> {
-    let star = rhs.find('*').unwrap();
-    let rx_str = rhs[..star].trim();
-    let after_star = rhs[star + 1..].trim();
-    let ry_end = after_star.find('(').unwrap_or(after_star.len());
-    let ry_str = after_star[..ry_end].trim();
-    let modifier = if ry_end < after_star.len() {
-        after_star[ry_end..].trim()
-    } else {
-        ""
-    };
-
-    let rx = parse_dreg(rx_str, line)?;
-    let ry = parse_dreg(ry_str, line)?;
-
-    if is_float {
-        Ok(ComputeOp::Mul(MulOp::FMul { rn, rx, ry }))
-    } else if modifier.contains("SSI") {
-        Ok(ComputeOp::Mul(MulOp::MulSsi { rn, rx, ry }))
-    } else {
-        // Default SHARC integer multiply is signed-signed fractional
-        // when no modifier is given; (SSF), (UUF) etc. select variants.
-        Ok(ComputeOp::Mul(MulOp::MulSsf { rn, rx, ry }))
+fn parse_reg_mul(dst: &str, rn: u16, rhs: &str, is_float: bool, line: u32) -> Result<ComputeOp> {
+    if !is_float {
+        return parse_fixed_mul(dst, rhs, line);
     }
+    let (rx_str, ry_str) = rhs.split_once('*').ok_or_else(|| Error::Parse {
+        line,
+        msg: format!("expected '*' in multiply: {rhs}"),
+    })?;
+    let rx = parse_dreg(rx_str.trim(), line)?;
+    let ry = parse_dreg(ry_str.trim(), line)?;
+    Ok(ComputeOp::Mul(MulOp::FMul { rn, rx, ry }))
 }
 
 fn parse_min_max_clip(
@@ -4428,17 +5962,33 @@ fn parse_clip(rn: u16, rhs: &str, is_float: bool, line: u32) -> Result<ComputeOp
 /// Resolve an absolute address: parse as number, eval as constant expression,
 /// or treat as a symbolic reference (placeholder 0 with the symbol name
 /// for relocation). Returns (value, optional_symbol_name).
-fn resolve_abs_addr(text: &str, _line: u32) -> (u32, Option<String>) {
-    if let Some(v) = parse_signed_number(text) {
-        return (v as u32, None);
+fn resolve_abs_addr(text: &str, line: u32) -> Result<(u32, Option<String>)> {
+    // A 32-bit address: the reference assembler rejects `dm ( -0x100000000 ) = r0`, which
+    // selas truncated.
+    if let Some(v) = parse_signed_number(text).or_else(|| eval_const_expr(text)) {
+        return Ok((fit_data32(v, "address", line)? as u32, None));
     }
-    if let Some(v) = eval_const_expr(text) {
-        return (v as u32, None);
+    // A forward-referenced symbol: 0 as placeholder; the caller emits a
+    // relocation so the linker patches the absolute address.
+    if is_valid_label(text.trim()) {
+        return Ok((0, Some(text.trim().to_string())));
     }
-    // Treat as a forward-referenced symbol. Return 0 as placeholder;
-    // the caller must emit a relocation so the linker patches the
-    // absolute address at link time.
-    (0, Some(text.to_string()))
+    // `label ± constant` (`r0 = dm(ldr.+4)`): the
+    // constant travels as the relocation addend (assemble.rs leaves 0 in
+    // the field). It used to become a relocation against a symbol named
+    // `LDR.+4`, which cannot link.
+    if let Some((label, adj)) = split_label_addend(text.trim()) {
+        if is_valid_label(label) {
+            return Ok((
+                fit_data32(adj, "address offset", line)? as u32,
+                Some(label.to_string()),
+            ));
+        }
+    }
+    Err(Error::Parse {
+        line,
+        msg: format!("invalid address: {text}"),
+    })
 }
 
 /// Find the closing ')' that matches the '(' at `open`, respecting nesting.
@@ -4594,10 +6144,12 @@ fn extract_width_modifier(s: &str) -> (&str, Option<&str>) {
             return (stripped.trim(), Some(suffix));
         }
     }
-    if let Some(pos) = s.rfind(" (") {
-        let candidate = s[pos..].trim();
+    // The reference assembler writes the suffix spaced as often as not: `r0 = dm ( i0 , m4
+    // ) ( lw )`.
+    if let Some(pos) = s.rfind('(') {
+        let candidate: String = s[pos..].chars().filter(|c| !c.is_whitespace()).collect();
         for suffix in &["(LW)", "(BW)", "(BWSE)", "(SW)", "(SWSE)", "(NW)"] {
-            if candidate == *suffix {
+            if candidate == *suffix && !s[..pos].trim().is_empty() {
                 return (s[..pos].trim(), Some(suffix));
             }
         }
@@ -4672,7 +6224,6 @@ fn is_ignored_directive(upper: &str) -> bool {
         || upper.starts_with(".ENTRY")
         || upper.starts_with(".PRIORITY")
         || upper.starts_with(".ROUND_")
-        || upper.starts_with(".INC/")
         || upper.starts_with(".MESSAGE")
         || upper.starts_with(".STRUCT")
 }
@@ -4783,10 +6334,14 @@ fn parse_reg_index(name: &str, prefix: char, line: u32) -> Result<u8> {
             line,
             name: name.to_string(),
         })?;
-    rest.parse::<u8>().map_err(|_| Error::UnknownRegister {
-        line,
-        name: name.to_string(),
-    })
+    // I/M/S registers run 0-15 (the reference assembler rejects `i99 = modify (i99, m14) (sw)`).
+    rest.parse::<u8>()
+        .ok()
+        .filter(|&n| n < 16)
+        .ok_or_else(|| Error::UnknownRegister {
+            line,
+            name: name.to_string(),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -5039,7 +6594,9 @@ fn expr_atom(bytes: &[u8], pos: &mut usize) -> Option<i64> {
             }
             let hex_str = std::str::from_utf8(&bytes[hex_start..*pos]).ok()?;
             let v = u64::from_str_radix(hex_str, 16).ok()?;
-            Some(v as i64)
+            // Each literal fits 32 bits: the reference assembler folds `0xffffffff - 1` and
+            // rejects `0x100000000 - 1`.
+            (v <= 0xFFFF_FFFF).then_some(v as i64)
         } else if *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
             while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
                 *pos += 1;
@@ -5049,7 +6606,7 @@ fn expr_atom(bytes: &[u8], pos: &mut usize) -> Option<i64> {
                 return None;
             }
             let num_str = std::str::from_utf8(&bytes[start..*pos]).ok()?;
-            num_str.parse::<i64>().ok()
+            num_str.parse::<i64>().ok().filter(|&v| v <= 0xFFFF_FFFF)
         } else {
             None // not a number, probably a register name or other token
         }
@@ -5074,8 +6631,10 @@ fn parse_signed_number(s: &str) -> Option<i64> {
     // Handle negative hex: "-0xNNNN" or "-0XNNNN"
     if let Some(rest) = s.strip_prefix('-') {
         let rest = rest.trim();
+        // i64, so a value past 32 bits reaches the range checks instead
+        // of wrapping in eval_const_expr (`cjump -0x100000000` became 0).
         if let Some(hex) = rest.strip_prefix("0X").or_else(|| rest.strip_prefix("0x")) {
-            return u32::from_str_radix(hex, 16).ok().map(|v| -(v as i64));
+            return i64::from_str_radix(hex, 16).ok().map(|v| -v);
         }
         if let Ok(v) = rest.parse::<i64>() {
             return Some(-v);
@@ -5100,14 +6659,17 @@ fn parse_address_or_label(s: &str, line: u32) -> Result<(u32, Option<String>)> {
     } else {
         s
     };
+    // "(PC, x)": a PC-relative offset or label. It used to fall through
+    // to the label case and become a symbol named "PC, 0x800".
+    let s = match s.split_once(',') {
+        Some((pc, rest)) if pc.trim().eq_ignore_ascii_case("PC") => rest.trim(),
+        _ => s,
+    };
     if let Some(val) = parse_number(s) {
         return Ok((val, None));
     }
-    // Symbolic label — return 0 placeholder + the label name
-    // Labels may start with '_', '.', or an alphabetic character.
-    if !s.is_empty()
-        && (s.starts_with('_') || s.starts_with('.') || s.as_bytes()[0].is_ascii_alphabetic())
-    {
+    // Symbolic label — return 0 placeholder + the label name.
+    if is_valid_label(s) {
         return Ok((0, Some(s.to_string())));
     }
     Err(Error::Parse {
@@ -5123,42 +6685,41 @@ fn ureg_code(name: &str) -> Option<u16> {
     // since names like MODE1 start with M which would otherwise match
     // modify registers.
     let named = match name {
-        // Special registers group 0x6x
+        // System registers, numbered as in the SHARC+ universal register
+        // code table. The reference assembler uses these codes in every form: 48-bit Type 17
+        // `pcstk = 0x100000` = 0f6400100000, `mmask = 0x100000` =
+        // 0f7300100000; 32-bit `tperiod = r0` = 703e373f.
         "FADDR" => Some(0x60),
         "DADDR" => Some(0x61),
-        "PC" => Some(0x62),
-        "PCSTK" => Some(0x63),
-        "PCSTKP" => Some(0x64),
-        "LADDR" => Some(0x65),
-        "CURLCNTR" => Some(0x66),
-        "LCNTR" => Some(0x67),
-        "EMUCLK" => Some(0x68),
-        "EMUCLK2" => Some(0x69),
-        "PX" => Some(0x6C),
-        "PX1" => Some(0x6D),
-        "PX2" => Some(0x6E),
-        // System registers group 0x7x
-        "MODE1" => Some(0x70),
-        "MODE2" => Some(0x71),
-        "FLAGS" => Some(0x72),
-        "ASTAT" | "ASTATX" | "ASTATx" => Some(0x73),
-        "ASTATY" | "ASTATy" => Some(0x74),
-        "STKY" | "STKYX" | "STKYx" => Some(0x75),
-        "STKYY" | "STKYy" => Some(0x76),
-        "IRPTL" => Some(0x78),
-        "IMASK" => Some(0x79),
-        "IMASKP" => Some(0x7A),
-        "LRPTL" | "LIRPTL" => Some(0x7B),
-        "MMASK" => Some(0x7C),
+        "PC" => Some(0x63),
+        "PCSTK" => Some(0x64),
+        "PCSTKP" => Some(0x65),
+        "LADDR" => Some(0x66),
+        "CURLCNTR" => Some(0x67),
+        "LCNTR" => Some(0x68),
+        "EMUCLK" => Some(0x69),
+        "EMUCLK2" => Some(0x6A),
+        "PX" => Some(0x6B),
+        "PX1" => Some(0x6C),
+        "PX2" => Some(0x6D),
+        "TPERIOD" => Some(0x6E),
+        "TCOUNT" => Some(0x6F),
+        "USTAT1" => Some(0x70),
+        "USTAT2" => Some(0x71),
+        "MODE1" => Some(0x72),
+        "MMASK" => Some(0x73),
+        "MODE2" => Some(0x74),
+        "FLAGS" => Some(0x75),
+        "ASTAT" | "ASTATX" | "ASTATx" => Some(0x76),
+        "ASTATY" | "ASTATy" => Some(0x77),
+        "STKY" | "STKYX" | "STKYx" => Some(0x78),
+        "STKYY" | "STKYy" => Some(0x79),
+        "IRPTL" => Some(0x7A),
+        "IMASK" => Some(0x7B),
+        "IMASKP" => Some(0x7C),
         "MODE1STK" => Some(0x7D),
-        // User status registers group 0x8x
-        "USTAT1" => Some(0x80),
-        "USTAT2" => Some(0x81),
-        "USTAT3" => Some(0x82),
-        "USTAT4" => Some(0x83),
-        // Timer registers group 0x9x
-        "TPERIOD" => Some(0x90),
-        "TCOUNT" => Some(0x91),
+        "USTAT3" => Some(0x7E),
+        "USTAT4" => Some(0x7F),
         _ => None,
     };
     if named.is_some() {
@@ -5246,68 +6807,6 @@ mod tests {
             "round-trip mismatch for '{}': orig={:?} reparsed={:?}",
             text, instr, parsed
         );
-    }
-
-    /// Assemble one line and return its bytes as hex (Selache parcel order, as `encode` returns them).
-    fn word(src: &str) -> String {
-        let bytes = encode::encode(&parse_instruction(src).unwrap()).unwrap();
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
-    /// Immediate shifts carry the PRM Table 17-9 shiftimm opcode (bits 22-16); a negative LSHIFT/ASHIFT count (also the OR forms)
-    /// sets dataex (bits 30-27) to 0xF. The expected words are the stock firmware's shapes.
-    #[test]
-    fn imm_shift_opcodes_follow_prm_table_17_9() {
-        for (src, want) in [
-            ("R0 = LSHIFT R11 BY -16", "023e7800f00b"),
-            ("R0 = LSHIFT R11 BY 16", "023e0000100b"),
-            ("R0 = ASHIFT R11 BY -3", "023e7801fd0b"),
-            ("R0 = ASHIFT R11 BY 3", "023e0001030b"),
-            ("R0 = R0 OR LSHIFT R11 BY 3", "023e0008030b"),
-            ("R0 = R0 OR ASHIFT R11 BY -3", "023e7809fd0b"),
-            ("R0 = ROT R11 BY 3", "023e0002030b"),
-            ("R0 = FEXT R11 BY 4:8", "023e1010040b"),
-            ("R0 = FDEP R11 BY 4:8", "023e1011040b"),
-            ("R0 = FEXT R11 BY 4:8 (SE)", "023e1012040b"),
-            ("R0 = FDEP R11 BY 4:8 (SE)", "023e1013040b"),
-            ("R0 = R0 OR FDEP R11 BY 4:8", "023e101b040b"),
-            ("R0 = R0 OR FDEP R11 BY 4:8 (SE)", "023e101d040b"),
-            ("R0 = BSET R11 BY 5", "023e0030050b"),
-            ("BTST R11 BY 5", "023e0033050b"),
-        ] {
-            assert_eq!(word(src), want, "{src}");
-        }
-        assert!(parse_instruction("R0 = R0 OR FEXT R11 BY 4:8").is_err());
-    }
-
-    /// A direct DM access with (BW)/(BWSE)/(SW)/(SWSE) is Type 14d (PRM Figure 16-2): byte0 0x1A (0x1B for a store), l = bit 38 for a
-    /// short word, x = bit 36 for sign extension, dreg in bits 35-32. Without a suffix it stays Type 14.
-    #[test]
-    fn direct_sub_word_access_is_type_14d() {
-        for (src, want) in [
-            ("R3 = DM(0x256008)", "100300256008"),
-            ("R3 = DM(0x256008) (SW)", "1a4300256008"),
-            ("R3 = DM(0x256008) (SWSE)", "1a5300256008"),
-            ("R3 = DM(0x256008) (BW)", "1a0300256008"),
-            ("R3 = DM(0x256008) (BWSE)", "1a1300256008"),
-            ("DM(0x256008) = R3 (SW)", "1b4300256008"),
-            ("DM(0x256008) = R3 (BW)", "1b0300256008"),
-        ] {
-            let bytes = encode::encode(&parse_instruction(src).unwrap()).unwrap();
-            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            assert_eq!(hex, want, "{src}");
-            // The disassembler reads the same word back to the same instruction.
-            if want.starts_with("1a") || want.starts_with("1b") {
-                let text = &disasm::disassemble(&bytes, 0, false)[0].text;
-                assert_eq!(
-                    encode::encode(&parse_instruction(text).unwrap()).unwrap(),
-                    bytes,
-                    "{text}"
-                );
-            }
-        }
-        assert!(parse_instruction("DM(0x256008) = R3 (SWSE)").is_err());
-        assert!(parse_instruction("R16 = DM(0x256008) (SW)").is_err());
     }
 
     #[test]
@@ -5648,6 +7147,7 @@ mod tests {
             cond: 31,
             delayed: false,
             target: BranchTarget::Absolute(0x001234),
+            loop_abort: false,
         });
     }
 
@@ -5658,6 +7158,7 @@ mod tests {
             cond: 31,
             delayed: false,
             target: BranchTarget::Absolute(0x005678),
+            loop_abort: false,
         });
     }
 
@@ -5668,6 +7169,7 @@ mod tests {
             cond: 16, // NE
             delayed: false,
             target: BranchTarget::Absolute(0x000100),
+            loop_abort: false,
         });
     }
 
@@ -5678,6 +7180,7 @@ mod tests {
             cond: 31,
             delayed: false,
             target: BranchTarget::PcRelative(10),
+            loop_abort: false,
         });
     }
 
@@ -5688,6 +7191,7 @@ mod tests {
             cond: 31,
             delayed: false,
             target: BranchTarget::PcRelative(-5),
+            loop_abort: false,
         });
     }
 
@@ -5777,6 +7281,7 @@ mod tests {
         roundtrip(&Instruction::DoLoop {
             counter: LoopCounter::Immediate(100),
             end_pc: 0x002000,
+            f: false,
         });
     }
 
@@ -5785,6 +7290,7 @@ mod tests {
         roundtrip(&Instruction::DoLoop {
             counter: LoopCounter::Ureg(0x05),
             end_pc: 0x003000,
+            f: false,
         });
     }
 
@@ -5836,8 +7342,9 @@ mod tests {
 
     #[test]
     fn test_parse_dm_load_imm() {
-        // Standalone load with integer offset uses Type 15 (UregMemAccess).
-        let instr = parse_instruction("R2 = DM(I6, 1)").unwrap();
+        // Standalone pre-modify load with integer offset uses Type 15
+        // (UregMemAccess); DM(Ii, imm) would be post-modify.
+        let instr = parse_instruction("R2 = DM(1, I6)").unwrap();
         match instr {
             Instruction::UregMemAccess {
                 pm,
@@ -5859,8 +7366,8 @@ mod tests {
 
     #[test]
     fn test_parse_dm_store_imm() {
-        // Standalone store with integer offset uses Type 15 (UregMemAccess).
-        let instr = parse_instruction("DM(I0, 1) = R3").unwrap();
+        // Standalone pre-modify store with integer offset uses Type 15.
+        let instr = parse_instruction("DM(1, I0) = R3").unwrap();
         match instr {
             Instruction::UregMemAccess {
                 pm,
@@ -5877,6 +7384,41 @@ mod tests {
                 assert_eq!(offset, 1);
             }
             other => panic!("expected UregMemAccess, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropped_operation_check_compares_parallel_parts() {
+        // The decode-and-count check (oracle: 2,321 rows refused). Its two
+        // assemble-level examples, `r0 = pass r15 , i7 = b2w ( i7 )` and
+        // `r0 = sat mrf ( sf ) , r2 = r1`, now encode in full.
+        let pass = Instruction::Compute {
+            cond: 31,
+            compute: ComputeOp::Alu(AluOp::Pass { rn: 0, rx: 15 }),
+        };
+        assert!(check_no_dropped_operations("R0 = PASS R15 , I7 = B2W ( I7 )", &pass, 1).is_err());
+        assert!(check_no_dropped_operations("R0 = PASS R15", &pass, 1).is_ok());
+    }
+
+    #[test]
+    fn test_parse_dm_post_modify_imm_is_type4_with_update() {
+        // DM(Ii, imm) accesses Ii and then updates it; only Type 4 can say so.
+        for (source, write) in [("R2 = DM(I6, 1)", false), ("DM(I0, 1) = R3", true)] {
+            match parse_instruction(source).unwrap() {
+                Instruction::ComputeLoadStore {
+                    compute: None,
+                    access,
+                    offset: 1,
+                    post_modify: true,
+                    ..
+                } => assert_eq!(access.write, write, "{source}"),
+                other => panic!("{source}: expected post-modify Type 4, got {other:?}"),
+            }
+        }
+        // The data6 field takes -0x20..=0x3f (type4_offset); PM needs a
+        // DAG2 I register (`r0 = pm ( i8 , 0x0 )` = 617e003f).
+        for source in ["I1 = DM(I6, 1)", "R2 = DM(I6, 64)", "R2 = PM(I2, 1)"] {
+            assert!(parse_instruction(source).is_err(), "{source}");
         }
     }
 
@@ -5903,7 +7445,7 @@ mod tests {
     #[test]
     fn roundtrip_bit_tst() {
         roundtrip(&Instruction::BitOp {
-            op: 2,
+            op: 4,
             sreg: 0x0B,
             data: 0xFF,
         });
@@ -5912,8 +7454,17 @@ mod tests {
     #[test]
     fn roundtrip_bit_xor() {
         roundtrip(&Instruction::BitOp {
-            op: 3,
+            op: 5,
             sreg: 0x05,
+            data: 0x0F0F,
+        });
+    }
+
+    #[test]
+    fn roundtrip_bit_tgl() {
+        roundtrip(&Instruction::BitOp {
+            op: 2,
+            sreg: 0x02,
             data: 0x0F0F,
         });
     }
@@ -5939,11 +7490,9 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_cjump() {
-        roundtrip(&Instruction::CJump {
-            addr: 0x001234,
-            delayed: false,
-        });
+    fn cjump_without_db_is_an_error() {
+        // The reference assembler rejects CJUMP without (DB) (176 rows).
+        assert!(parse_instruction("CJUMP 0x001234").is_err());
     }
 
     #[test]
@@ -5951,6 +7500,7 @@ mod tests {
         roundtrip(&Instruction::CJump {
             addr: 0x005678,
             delayed: true,
+            relative: false,
         });
     }
 
@@ -5969,6 +7519,8 @@ mod tests {
             m_reg: 1,
             cond: 31,
             compute: None,
+            dest_xor: 0,
+            width: MemWidth::Normal,
         });
     }
 
@@ -5980,6 +7532,8 @@ mod tests {
             m_reg: 0,
             cond: 31,
             compute: None,
+            dest_xor: 0,
+            width: MemWidth::Normal,
         });
     }
 
@@ -5995,6 +7549,8 @@ mod tests {
                 rx: 1,
                 ry: 2,
             })),
+            dest_xor: 0,
+            width: MemWidth::Normal,
         });
     }
 
@@ -6469,5 +8025,82 @@ mod tests {
             line.extra_label_refs,
             vec![("ldf_stack_length".to_string(), 1)]
         );
+    }
+
+    // Ported from ElekLabs/selache fix/encodings (Em D).
+    fn word(src: &str) -> String {
+        let bytes = encode::encode(&parse_instruction(src).unwrap()).unwrap();
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Immediate shifts carry the PRM Table 17-9 shiftimm opcode (bits 22-16); a negative LSHIFT/ASHIFT count (also the OR forms)
+    /// sets dataex (bits 30-27) to 0xF. The expected words are the vendor's shapes.
+    #[test]
+    fn imm_shift_opcodes_follow_prm_table_17_9() {
+        for (src, want) in [
+            ("R0 = LSHIFT R11 BY -16", "023e7800f00b"),
+            ("R0 = LSHIFT R11 BY 16", "023e0000100b"),
+            ("R0 = ASHIFT R11 BY -3", "023e7801fd0b"),
+            ("R0 = ASHIFT R11 BY 3", "023e0001030b"),
+            ("R0 = R0 OR LSHIFT R11 BY 3", "023e0008030b"),
+            ("R0 = R0 OR ASHIFT R11 BY -3", "023e7809fd0b"),
+            ("R0 = ROT R11 BY 3", "023e0002030b"),
+            ("R0 = FEXT R11 BY 4:8", "023e1010040b"),
+            ("R0 = FEXT R11 BY 4:8 (SE)", "023e1012040b"),
+            // OR FDEP by an immediate is shiftimm 0x19 (register opcode 0x64 >> 2), not 0x1b: the
+            // reference assembler emits `R0 = R0 OR FDEP R12 BY 0x10:0x1` as 023e0019500c. 0x1b is
+            // OR FDEP (SE) (0x6c >> 2), and 0x1d is no shiftimm opcode.
+            ("R0 = R0 OR FDEP R11 BY 4:8", "023e1019040b"),
+            ("R0 = BSET R11 BY 5", "023e0030050b"),
+            ("BTST R11 BY 5", "023e0033050b"),
+        ] {
+            assert_eq!(word(src), want, "{src}");
+        }
+        assert!(parse_instruction("R0 = R0 OR FEXT R11 BY 4:8").is_err());
+        // No reference-assembler vector yet for these immediate forms, so they are refused
+        // (use the register form). Expected once measured: FDEP 0x11, FDEP (SE) 0x13,
+        // OR FDEP (SE) 0x1b.
+        for src in [
+            "R0 = FDEP R11 BY 4:8",
+            "R0 = FDEP R11 BY 4:8 (SE)",
+            "R0 = R0 OR FDEP R11 BY 4:8 (SE)",
+        ] {
+            assert!(parse_instruction(src).is_err(), "{src}");
+        }
+    }
+
+    /// A direct DM access with (BW)/(BWSE)/(SW)/(SWSE) is Type 14d (PRM Figure 16-2): byte0 0x1A (0x1B for a store), l = bit 38 for a
+    /// short word, x = bit 36 for sign extension, dreg in bits 35-32. Without a suffix it stays Type 14.
+    #[test]
+    fn direct_sub_word_access_is_type_14d() {
+        for (src, want) in [
+            ("R3 = DM(0x256008)", "100300256008"),
+            ("R3 = DM(0x256008) (SW)", "1a4300256008"),
+            ("R3 = DM(0x256008) (SWSE)", "1a5300256008"),
+            ("R3 = DM(0x256008) (BW)", "1a0300256008"),
+            ("R3 = DM(0x256008) (BWSE)", "1a1300256008"),
+            ("DM(0x256008) = R3 (SW)", "1b4300256008"),
+            ("DM(0x256008) = R3 (BW)", "1b0300256008"),
+        ] {
+            let bytes = encode::encode(&parse_instruction(src).unwrap()).unwrap();
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, want, "{src}");
+            // The disassembler reads the same word back to the same instruction.
+            if want.starts_with("1a") || want.starts_with("1b") {
+                let text = &disasm::disassemble(&bytes, 0, false)[0].text;
+                assert_eq!(
+                    encode::encode(&parse_instruction(text).unwrap()).unwrap(),
+                    bytes,
+                    "{text}"
+                );
+            }
+        }
+        // A store has nothing to sign-extend: the assembler refuses it.
+        assert!(crate::assemble::assemble_source(
+            ".SECTION/PM seg_pmco;\nDM(0x256008) = R3 (SWSE);\n",
+            true
+        )
+        .is_err());
+        assert!(parse_instruction("R16 = DM(0x256008) (SW)").is_err());
     }
 }

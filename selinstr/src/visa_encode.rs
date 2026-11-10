@@ -11,7 +11,10 @@
 //! The encoding strategy reuses the proven ISA encoder and works backward
 //! from the VISA decoder's bit layouts in `visa.rs`.
 
-use crate::encode::{AluOp, ComputeOp, FaluOp, Instruction, MulOp, ShiftOp};
+use crate::encode::{
+    self, AluOp, ComputeOp, DagWidth, EncodeError, FaluOp, Instruction, MemWidth, MulOp, MultiOp,
+    ShiftOp,
+};
 
 // Type 2c short-compute is a 16-bit `Rn = Rn OP Ry` family. The 5-bit
 // opcode field at bits[12:8] selects which compute operation runs on
@@ -29,18 +32,20 @@ use crate::encode::{AluOp, ComputeOp, FaluOp, Instruction, MulOp, ShiftOp};
 //   op 4  Rn = NOT Ry   (Alu Not)
 //   op 5  Rn = Ry + 1   (Alu Inc)
 //   op 6  Rn = Ry - 1   (Alu Dec)
-//   op 7  Rn = Rn + Ry + ci  (Alu AddCi)
+//   op 7  Rn = Rn * Ry (SSI)  (Mul MulSsi; the reference assembler c701. It was listed
+//         as Rn = Rn + Ry + ci, which has no 16-bit form)
 //   op 8  Fn = Fn + Fy  (Falu Add)
 //   op 9  Fn = Fn - Fy  (Falu Sub)
+//   op 10 Fn = FLOAT Ry (Falu Float; all 323 vendor rows, e.g. The reference assembler
+//         `f0 = float r0` = ca00, `f1 = float r2` = ca12)
 //   op 11 comp(Fx, Fy)  (Falu Comp)
 //   op 12 Rn = Rn AND Ry (Alu And)
 //   op 13 Rn = Rn OR Ry  (Alu Or)
 //   op 14 Rn = Rn XOR Ry (Alu Xor)
 //   op 15 Fn = Fn * Fy   (Mul FMul)
-// Other ops (10, plus the 8/9 int-Neg/int-Abs aliases the older table
-// contained) round-trip cleanly inside this crate but do not match
-// hardware semantics, so they are intentionally absent from
-// `try_type2c`. Falu Pass also has no Type 2c form: easm21k routes
+// The int-Neg/int-Abs aliases the older table had at 8/9 round-trip
+// cleanly inside this crate but do not match hardware semantics, so
+// they are intentionally absent from `try_type2c`. Falu Pass also has no Type 2c form: the reference assembler routes
 // `Fn = pass Fy` through the 32-bit Type 2b path (`018a 12rr`).
 
 /// Result of VISA compression.
@@ -88,44 +93,12 @@ impl VisaEncoded {
     }
 }
 
-/// Translate a normal 48-bit ISA universal-register code into the compact
-/// SW/VISA 7-bit ureg field. The 32-bit forms use a different numbering
-/// for system registers; copying the ISA value directly makes
-/// `ASTATx` stores/restores hit `MODE2` on hardware.
+/// The compact SW/VISA 7-bit ureg field. Parsed instructions already carry
+/// the universal register code that both widths use (vendor `astatx` is
+/// 0x76 in 48-bit Type 15 `ac76…` and in 32-bit forms alike); codes above
+/// 0x7F do not fit.
 fn visa_ureg_code(ureg: u16) -> Option<u16> {
-    let mapped = match ureg {
-        // R/I/M/L/B/S registers keep their ISA numbering.
-        0x00..=0x5F => ureg,
-        // Group 6 system registers. The compact map removes/reserves
-        // several gaps and shifts PC onward by one slot.
-        0x60 => 0x60, // FADDR
-        0x61 => 0x61, // DADDR
-        0x62 => 0x63, // PC
-        0x63 => 0x64, // PCSTK
-        0x64 => 0x65, // PCSTKP
-        0x65 => 0x66, // LADDR
-        0x66 => 0x67, // CURLCNTR
-        0x67 => 0x68, // LCNTR
-        0x68 => 0x69, // EMUCLK
-        0x69 => 0x6A, // EMUCLK2
-        0x6C => 0x6B, // PX
-        0x6D => 0x6C, // PX1
-        0x6E => 0x6D, // PX2
-        // Group 7 system registers in the SW/VISA 32-bit encoding.
-        0x70 => 0x72, // MODE1
-        0x71 => 0x74, // MODE2
-        0x72 => 0x75, // FLAGS
-        0x73 => 0x76, // ASTATx
-        0x74 => 0x77, // ASTATy
-        0x75 => 0x78, // STKYx
-        0x76 => 0x79, // STKYy
-        0x78 => 0x7A, // IRPTL
-        0x79 => 0x7B, // IMASK
-        0x7A => 0x7C, // IMASKP
-        0x7D => 0x7D, // MODE1STK
-        _ => return None,
-    };
-    Some(mapped)
+    (ureg <= 0x7F).then_some(ureg)
 }
 
 /// Attempt VISA compression of an instruction.
@@ -141,7 +114,65 @@ pub fn visa_encode(instr: &Instruction, isa_bytes: &[u8; 6]) -> VisaEncoded {
     if let Some(w32) = try_32bit(instr) {
         return VisaEncoded::W32(w32);
     }
+    if let Some(w32) = try_marker32(instr, isa_bytes) {
+        return VisaEncoded::W32(w32);
+    }
     VisaEncoded::W48(*isa_bytes)
+}
+
+/// The 32-bit form of Types 1, 3, 4 and 5 without a compute: the top 32
+/// bits of the 48-bit word with the marker 0x3f in bits 5:0 (word bits
+/// 21:16, an empty compute's). The reference assembler never emits such a word in 48-bit
+/// form: 0 of its accepted rows, against 6,202 in 32-bit, e.g.
+/// `if ac r0 = m6` = 7247003f (48-bit 724700000000), `curlcntr = dm ( i4 ,
+/// m2 )` = 58be33bf, `dm ( i0 , m0 ) = r4 , pm ( i8 , m10 ) = r8` =
+/// 3028143f. selas left the conditional, PM and system-register forms
+/// 48-bit. Short and byte widths use other markers (0x3c, 0x38) and stay
+/// with their own encoders.
+fn try_marker32(instr: &Instruction, isa: &[u8; 6]) -> Option<u32> {
+    let normal_width = match *instr {
+        // No vendor vector for a register swap (`r5 <-> s5`); it stays
+        // 48-bit.
+        Instruction::DualMove { .. }
+        | Instruction::UregTransfer { .. }
+        | Instruction::URegMove { .. } => true,
+        Instruction::UregDagMove { width, .. } | Instruction::ComputeLoadStore { width, .. } => {
+            width == DagWidth::Normal
+        }
+        _ => false,
+    };
+    let word = isa.iter().fold(0u64, |w, &b| (w << 8) | u64::from(b));
+    let top3 = word >> 45;
+    if !normal_width || !(1..=3).contains(&top3) || word & 0x7F_FFFF != 0 {
+        return None;
+    }
+    Some(((word >> 16) as u32) | 0x3F)
+}
+
+/// Encode VISA, propagating encoder errors. Unsupported forms (including
+/// access widths without a vendor-confirmed encoding) fail in `encode::encode`
+/// rather than falling back to a different memory access width.
+pub fn encode_visa(instr: &Instruction) -> Result<VisaEncoded, EncodeError> {
+    match encode::encode(instr) {
+        Ok(isa) => Ok(visa_encode(instr, &isa)),
+        // A width-suffixed Type 4 access exists only as 32-bit Type 4b, and
+        // the Type 3 widths without a 48-bit vector only as Type 3b. PM
+        // Type 4 has only 32-bit vendor vectors (617e003f).
+        Err(e) => match instr {
+            Instruction::ComputeLoadStore { width, .. }
+            | Instruction::UregDagMove { width, .. }
+                if *width != DagWidth::Normal =>
+            {
+                try_32bit(instr).map(VisaEncoded::W32).ok_or(e)
+            }
+            Instruction::ComputeLoadStore {
+                access,
+                compute: None,
+                ..
+            } if access.pm => try_32bit(instr).map(VisaEncoded::W32).ok_or(e),
+            _ => Err(e),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,13 +185,24 @@ fn try_16bit(instr: &Instruction) -> Option<u16> {
         Instruction::Idle => Some(0x0081),
         Instruction::EmuIdle => Some(0x00C1),
         Instruction::Rframe => Some(0x1901),
+        // 16-bit RTS/RTI: 0x0A80 | RTI << 8 | DB << 6 | cond << 1 | LR.
+        // The reference assembler: `rts` = 0abe, `rts (db)` = 0afe, `rti` = 0bbe,
+        // `if eq rts (db)` = 0ac0, `if ne rti (db)` = 0be0, `if ne rts
+        // (lr)` = 0aa1. No vector combines DB with LR,
+        // so that form stays 48-bit.
         Instruction::Return {
-            interrupt: false,
-            cond: 31,
-            delayed: true,
-            lr: false,
+            interrupt,
+            cond,
+            delayed,
+            lr,
             compute: None,
-        } => Some(0x0AFE),
+        } if cond < 32 && !(delayed && lr) => Some(
+            0x0A80
+                | (u16::from(interrupt) << 8)
+                | (u16::from(delayed) << 6)
+                | (u16::from(cond) << 1)
+                | u16::from(lr),
+        ),
         Instruction::Compute { cond: 31, compute } => try_type2c(&compute),
         Instruction::UregDagMove {
             pm: false,
@@ -170,7 +212,8 @@ fn try_16bit(instr: &Instruction) -> Option<u16> {
             m_reg,
             cond: 31,
             compute: None,
-            ..
+            post_modify: true,
+            width: DagWidth::Normal,
         } => try_type3c(write, ureg, i_reg, m_reg),
         _ => None,
     }
@@ -197,7 +240,11 @@ fn try_type2c(compute: &ComputeOp) -> Option<u16> {
         ComputeOp::Alu(AluOp::Not { rn, rx }) if rn < 16 && rx < 16 => (4, rn, rx),
         ComputeOp::Alu(AluOp::Inc { rn, rx }) if rn < 16 && rx < 16 => (5, rn, rx),
         ComputeOp::Alu(AluOp::Dec { rn, rx }) if rn < 16 && rx < 16 => (6, rn, rx),
-        ComputeOp::Alu(AluOp::AddCi { rn, rx, ry }) if rn == rx && rn < 16 && ry < 16 => {
+        // Op 7 is the SSI multiply (the reference assembler `r0 = r0 * r1 (ssi)` = c701,
+        // 7 rows). selas used it for `Rn = Rn + Ry + CI`, so an
+        // add-with-carry ran as a multiply; that has no 16-bit form
+        // (`r0 = r0 + r1 + ci` = 01805001).
+        ComputeOp::Mul(MulOp::MulSsi { rn, rx, ry }) if rn == rx && rn < 16 && ry < 16 => {
             (7, rn, ry)
         }
         // Abs and Neg are intentionally *not* compressed into the
@@ -215,6 +262,7 @@ fn try_type2c(compute: &ComputeOp) -> Option<u16> {
         ComputeOp::Falu(FaluOp::Sub { rn, rx, ry }) if rn == rx && rn < 16 && ry < 16 => {
             (9, rn, ry)
         }
+        ComputeOp::Falu(FaluOp::Float { rn, rx }) if rn < 16 && rx < 16 => (10, rn, rx),
         ComputeOp::Falu(FaluOp::Comp { rx, ry }) if rx < 16 && ry < 16 => (11, rx, ry),
         ComputeOp::Alu(AluOp::And { rn, rx, ry }) if rn == rx && rn < 16 && ry < 16 => (12, rn, ry),
         ComputeOp::Alu(AluOp::Or { rn, rx, ry }) if rn == rx && rn < 16 && ry < 16 => (13, rn, ry),
@@ -268,25 +316,39 @@ fn try_32bit(instr: &Instruction) -> Option<u32> {
             m_reg,
             cond,
             compute: None,
-        } => try_type7b(pm, i_reg, m_reg, cond),
+            dest_xor,
+            width: MemWidth::Normal,
+        } => try_type7b(pm, i_reg, m_reg, cond, dest_xor),
         Instruction::LoadImm { ureg, value } => try_type17b(ureg, value),
         Instruction::UregDagMove {
-            pm: false,
+            pm,
             write,
             ureg,
             i_reg,
             m_reg,
             cond,
             compute: None,
-            ..
-        } => try_type3b(write, ureg, i_reg, m_reg, cond),
+            post_modify,
+            width,
+        } => try_type3b(pm, write, ureg, i_reg, m_reg, cond, post_modify, width),
         Instruction::ComputeLoadStore {
             compute: None,
             access,
             dreg,
             offset,
             cond,
-        } if !access.pm => try_type4b(access.write, access.i_reg, dreg, offset, cond),
+            post_modify,
+            width,
+        } => try_type4b(
+            access.pm,
+            access.write,
+            access.i_reg,
+            dreg,
+            offset,
+            cond,
+            post_modify,
+            width,
+        ),
         // 32-bit VISA Group-4 encoding for Type 15 (ureg <-> DM with
         // 7-bit signed offset, DAG1 only). selcc's stack-frame setup
         // emits `DM(-N,I6)=Rx;` and the matching reload as
@@ -298,15 +360,21 @@ fn try_32bit(instr: &Instruction) -> Option<u32> {
         // (garbage) instruction. Compressing here keeps every
         // selcc-emitted instruction within a single SW slot.
         Instruction::UregMemAccess {
-            pm: false,
+            pm,
             i_reg,
             write,
             lw,
             ureg,
             offset,
         } if i_reg < 8 && (-64..=63).contains(&offset) && ureg <= 0x7F => {
-            try_type15b(write, lw, i_reg, ureg, offset)
+            try_type15b(pm, write, lw, i_reg, ureg, offset)
         }
+        Instruction::ImmStore {
+            pm,
+            i_reg,
+            m_reg,
+            value,
+        } => try_type16b(pm, i_reg, m_reg, value),
         Instruction::URegMove { dest, src } => try_type5b_move(dest, src),
         Instruction::UregTransfer {
             src_ureg,
@@ -321,6 +389,7 @@ fn try_32bit(instr: &Instruction) -> Option<u32> {
             pm_m,
             delayed,
             compute: None,
+            else_compute: false,
         } => try_type9a_32bit(call, cond, pm_i, pm_m, delayed),
         _ => None,
     }
@@ -337,16 +406,17 @@ fn try_32bit(instr: &Instruction) -> Option<u32> {
 /// Only reachable for I12-I15; other PM I-registers fall through to 48-bit.
 /// `pm_i` and `pm_m` arrive as the full register index (0-15) from the
 /// parser, and the encoder only uses the low 3 bits for I8-I15 / M8-M15.
+/// Type 9a 32-bit form: the top 32 bits of the 48-bit word (`encode_type9a`)
+/// with the 0x3f marker. The reference assembler: `call (m14, i12)` = 08bf303f,
+/// `if lt jump (m14, i8) (db)` = 0802343f. The CALL bit used to sit at
+/// p1[6] and only I12-I15 were accepted.
 fn try_type9a_32bit(call: bool, cond: u8, pm_i: u8, pm_m: u8, delayed: bool) -> Option<u32> {
-    if !(12..=15).contains(&pm_i) || !(8..=15).contains(&pm_m) {
-        return None;
-    }
-    let pmi_off = pm_i - 12;
-    let pmm_off = pm_m - 8;
+    let i = (pm_i & 7) as u16;
+    let m = (pm_m & 7) as u16;
     let j = if call { 1u16 } else { 0 };
     let db = if delayed { 1u16 } else { 0 };
-    let p1 = (0b01000u16 << 8) | (j << 6) | ((cond as u16 & 0x1F) << 1) | 1;
-    let p2 = ((pmi_off as u16 & 3) << 14) | ((pmm_off as u16 & 7) << 11) | (db << 10) | 0x3f;
+    let p1 = (0b01000u16 << 8) | (j << 7) | ((cond as u16 & 0x1F) << 1) | (i >> 2);
+    let p2 = ((i & 3) << 14) | (m << 11) | (db << 10) | 0x3f;
     Some((p1 as u32) << 16 | p2 as u32)
 }
 
@@ -380,19 +450,19 @@ fn try_type2b(cond: u8, compute: &ComputeOp) -> Option<u32> {
 /// or when the XOR trick works.
 ///
 /// Layout: p1[7]=0 (32-bit flag), p1[6]=g, p1[5:1]=cond, p1[0]=i_src[2]
-///         p2[15:14]=i_src[1:0], p2[13:11]=m, p2[10:8]=dest_xor, p2[7:0]=0x3F (bit 7 zero, bits 6:0 = 0111111)
-/// (PRM Figure 14-20; SHARC Processor PGR Type 7b: "0111111" at bits 22-16 of the frame). Without those bits the word is a 48-bit Type 7a.
-fn try_type7b(pm: bool, i_reg: u8, m_reg: u8, cond: u8) -> Option<u32> {
-    // This is MODIFY(Ii, Mm) with the result going back to Ii.
-    // i_dest == i_src, so dest_xor = 0.
+///         p2[15:14]=i_src[1:0], p2[13:11]=m, p2[10:8]=dest_xor
+fn try_type7b(pm: bool, i_reg: u8, m_reg: u8, cond: u8, dest_xor: u8) -> Option<u32> {
+    // Top two parcels of the 48-bit Type 7 word plus the 0x3f 32-bit
+    // marker: the reference assembler `i1 = modify(i1,m4)` = 043e603f,
+    // `i1 = modify(i0,m4)` = 043e213f.
     let g = if pm { 1u16 } else { 0 };
     let i_local = i_reg & 7;
     let m_local = m_reg & 7;
-    let dest_xor = 0u16; // i_dest == i_src
+    let dest_xor = (dest_xor & 7) as u16;
 
     let p1 =
         (0b00000100u16 << 8) | (g << 6) | ((cond as u16 & 0x1F) << 1) | ((i_local as u16 >> 2) & 1);
-    let p2 = ((i_local as u16 & 3) << 14) | ((m_local as u16) << 11) | (dest_xor << 8) | 0x3F;
+    let p2 = ((i_local as u16 & 3) << 14) | ((m_local as u16) << 11) | (dest_xor << 8) | 0x3f;
     Some((p1 as u32) << 16 | p2 as u32)
 }
 
@@ -412,39 +482,62 @@ fn try_type17b(ureg: u16, value: u32) -> Option<u32> {
     Some((p1 as u32) << 16 | p2 as u32)
 }
 
-/// Type 3b: 32-bit ureg <-> DM with register addressing.
+/// Type 3b: 32-bit ureg <-> DM|PM with register addressing.
 ///
-/// Layout (from visa.rs decode_32_type3b):
-///   p1[12:9] = i-register index
-///   p1[7:6]  = m-register offset (m = field + 4, giving M4-M7)
-///   p1[5:1]  = cond
+///   p1[12]   = post-modify (0=pre-modify, 1=post-modify)
+///   p1[11:9] = I, p1[8:6] = M (within the DAG)
+///   p1[5:1]  = cond, p1[0] = G (PM, DAG2)
 ///   p2[15]   = direction (0=read, 1=write)
-///   p2[14]   = short-word flag
+///   p2[14]   = long/short-word flag
 ///   p2[13:7] = ureg code
-///   p2[1:0]  = access width (11=NW normal)
-fn try_type3b(write: bool, ureg: u16, i_reg: u8, m_reg: u8, cond: u8) -> Option<u32> {
-    // M register must be M4-M7 for Type 3b
-    if !(4..=7).contains(&m_reg) {
-        return None;
-    }
-    if i_reg > 7 {
+///   p2[5:0]  = 0x3c | width (11 normal/long, 00 short/byte, 01 sign-ext)
+#[allow(clippy::too_many_arguments)]
+fn try_type3b(
+    pm: bool,
+    write: bool,
+    ureg: u16,
+    i_reg: u8,
+    m_reg: u8,
+    cond: u8,
+    post_modify: bool,
+    width: DagWidth,
+) -> Option<u32> {
+    // p1 is the 48-bit word's top parcel: 010 U III MMM ccccc G (M is
+    // three bits; bit 8 used to be forced, so only M4-M7 compressed).
+    // p2 = D W uuuuuuu 1111LL: W (bit 14) long/short, LL 11 normal or long,
+    // 00 short or byte, 01 sign-extended. The reference assembler, all M0-M7:
+    // `curlcntr = dm ( i4 , m2 )` = 58be33bf, `r0 = dm(i0, m4)(lw)` =
+    // 513e403f, `r0 = dm(i0, m0)(sw)` = 503e403c, `r0 = dm(i0, m0)(bw)` =
+    // 503e003c, `r0 = dm(i0, m0)(swse)` = 503e403d, `dm(i1, m2) = r2(sw)`
+    // = 52bec13c.
+    if i_reg > 7 || m_reg > 7 {
         return None;
     }
     let ureg = visa_ureg_code(ureg)?;
-    let m_offset = (m_reg - 4) & 3;
-    let d = if write { 1u16 } else { 0 };
-
-    // p1: top3=010, sub bits. Bit 8 must be set as part of the W32 marker.
+    let (w, ll) = match width {
+        DagWidth::Normal => (0u16, 0b11u16),
+        DagWidth::Long => (1, 0b11),
+        DagWidth::Short => (1, 0b00),
+        DagWidth::Byte => (0, 0b00),
+        DagWidth::ShortSe => (1, 0b01),
+        DagWidth::ByteSe => (0, 0b01),
+    };
+    // Widths are vendor-observed on DM only (any register: `dm ( i4 , m6 )
+    // = m13 ( bw )` = 59be96bc); sign extension only on loads.
+    if width != DagWidth::Normal && pm {
+        return None;
+    }
+    if matches!(width, DagWidth::ShortSe | DagWidth::ByteSe) && write {
+        return None;
+    }
     let p1 = (0b010u16 << 13)
-        | ((i_reg as u16 & 0xF) << 9)
-        | (1u16 << 8)
-        | ((m_offset as u16) << 6)
-        | ((cond as u16 & 0x1F) << 1);
-    // p2: d, sw=0, ureg, then 0x3f marker in the low 6 bits. The VISA
-    // width disambiguator keys off `p2 & 0x3F >= 0x38` for top3=010 to
-    // decide 32-bit vs 48-bit, so the low 6 bits must all be set.
-    let p2 = (d << 15) | ((ureg & 0x7F) << 7) | 0x3f;
-    Some((p1 as u32) << 16 | p2 as u32)
+        | (u16::from(post_modify) << 12)
+        | (u16::from(i_reg) << 9)
+        | (u16::from(m_reg) << 6)
+        | ((u16::from(cond) & 0x1F) << 1)
+        | u16::from(pm);
+    let p2 = (u16::from(write) << 15) | (w << 14) | ((ureg & 0x7F) << 7) | 0x3C | ll;
+    Some((u32::from(p1) << 16) | u32::from(p2))
 }
 
 /// Type 4b: 32-bit dreg <-> DM with 6-bit immediate offset, no compute.
@@ -456,10 +549,33 @@ fn try_type3b(write: bool, ureg: u16, i_reg: u8, m_reg: u8, cond: u8) -> Option<
 ///   {p1[0], p2[15:11]} = 6-bit signed offset
 ///   p2[10:7] = dreg
 ///   p2[1:0]  = 11 (normal word)
-fn try_type4b(write: bool, i_reg: u8, dreg: u16, offset: i8, cond: u8) -> Option<u32> {
-    if i_reg > 15 || dreg > 15 {
+fn try_type4b(
+    pm: bool,
+    write: bool,
+    i_reg: u8,
+    dreg: u16,
+    offset: i8,
+    cond: u8,
+    post_modify: bool,
+    width: DagWidth,
+) -> Option<u32> {
+    if i_reg > 7 || dreg > 15 {
         return None;
     }
+    // Width markers: 0x3f normal, 0x3c short word, 0x38 byte word
+    // (the reference assembler 6a7e113f, 683e163c `r12 = dm(0x2, i4)(sw)`, 683e0938
+    // `r2 = dm(1, i4)(bw)`). The marker is independent of the update
+    // bit: 687e0838 is `r0 = dm(i4, 1)(bw)`.
+    // Sign-extending widths end 01: `r0 = dm ( i4 , 0x2 ) ( swse )` =
+    // 687e103d, `r0 = dm ( -0x5 , i2 ) ( bwse )` = 643fd839.
+    let marker = match width {
+        DagWidth::Normal => 0x3f,
+        DagWidth::Short => 0x3c,
+        DagWidth::Byte => 0x38,
+        DagWidth::ShortSe => 0x3d,
+        DagWidth::ByteSe => 0x39,
+        DagWidth::Long => return None,
+    };
     // Offset must fit in 6-bit signed (-32..31)
     if !(-32..=31).contains(&offset) {
         return None;
@@ -469,14 +585,19 @@ fn try_type4b(write: bool, i_reg: u8, dreg: u16, offset: i8, cond: u8) -> Option
     let off_hi = (raw6 >> 5) & 1; // bit 5 → p1[0]
     let off_lo = raw6 & 0x1F; // bits 4:0 → p2[15:11]
 
-    // p1: top3=011, sub varies, d at bit10, i at bits[12:9]
-    // From the decoder, p1[6]=0 means offset-first order. Let's use p1[6]=0.
+    // p1 is the top parcel of the 48-bit Type 4 word: i at [11:9], d at 7,
+    // u (post-modify) at 6, cond at [5:1]. The reference assembler: `r2=dm(i5,2)` =
+    // 6a7e113f, `if sz r15=dm(-3,i6)` = 6c11efbf.
+    // p1[8] (word bit 40) is G, PM through DAG2: `r0 = pm ( i8 , 0x0 )` =
+    // 617e003f, `pm ( i10 , 0x0 ) = r2` = 65fe013f.
     let p1 = (0b011u16 << 13)
-        | ((i_reg as u16 & 0xF) << 9)
-        | (d << 10)
+        | ((i_reg as u16 & 0x7) << 9)
+        | ((pm as u16) << 8)
+        | (d << 7)
+        | ((post_modify as u16) << 6)
         | ((cond as u16 & 0x1F) << 1)
         | off_hi;
-    let p2 = (off_lo << 11) | ((dreg & 0xF) << 7) | 0b11u16; // normal word
+    let p2 = (off_lo << 11) | ((dreg & 0xF) << 7) | marker;
     Some((p1 as u32) << 16 | p2 as u32)
 }
 
@@ -490,7 +611,11 @@ fn try_type4b(write: bool, i_reg: u8, dreg: u16, offset: i8, cond: u8) -> Option
 /// standard ureg-mem path. p1 bits 3:0 are fixed to 0x8 to match
 /// easm21k's encoding -- the ADSP-21569 ROM rejects forms with
 /// other lower-nibble values for this access type.
-fn try_type15b(write: bool, lw: bool, i_reg: u8, ureg: u16, offset: i32) -> Option<u32> {
+///
+/// p1 bit 5 is G (PM, DAG2): the reference assembler `pm ( 0x0 , i10 ) = r2` = 95280100,
+/// `m15 = pm ( 0x0 , i11 )` = 96281780; selas emitted every PM access
+/// as the 48-bit Type 15.
+fn try_type15b(pm: bool, write: bool, lw: bool, i_reg: u8, ureg: u16, offset: i32) -> Option<u32> {
     if i_reg > 7 {
         return None;
     }
@@ -514,9 +639,28 @@ fn try_type15b(write: bool, lw: bool, i_reg: u8, ureg: u16, offset: i32) -> Opti
         | ((i_reg as u16 & 7) << 9)
         | (d << 8)
         | (lw_bit << 7)
+        | (u16::from(pm) << 5)
         | 0x08;
     let p2 = ((ureg & 0x7F) << 7) | raw7;
     Some((p1 as u32) << 16 | p2 as u32)
+}
+
+/// Type 16b (32-bit `DM|PM(Ii, Mm) = imm16`): the 48-bit Type 16 first
+/// parcel (I 11:9, M 8:6, G 5) with bits 4:0 = 00100, then the immediate,
+/// sign-extended. The reference assembler uses it exactly when the value fits a signed
+/// 16-bit field: `dm ( i7 , m7 ) = 0x1000` = 9fc41000, `dm(i0, m0) = -0x1`
+/// = 9004ffff, `pm ( i10 , m8 ) = 0x0` = 94240000; 0x8000 stays 48-bit.
+fn try_type16b(pm: bool, i_reg: u8, m_reg: u8, value: u32) -> Option<u32> {
+    let value = value as i32;
+    if i_reg > 7 || m_reg > 7 || !(-0x8000..=0x7FFF).contains(&value) {
+        return None;
+    }
+    let p1 = (0b1001u16 << 12)
+        | (u16::from(i_reg) << 9)
+        | (u16::from(m_reg) << 6)
+        | (u16::from(pm) << 5)
+        | 0x04;
+    Some((u32::from(p1) << 16) | u32::from(value as u16))
 }
 
 /// Type 5b (32-bit ureg move): `dest_ureg = src_ureg`.
@@ -577,7 +721,17 @@ fn compute_to_23bit(compute: &ComputeOp) -> Option<u32> {
         ComputeOp::Falu(falu) => falu_to_23bit(falu),
         ComputeOp::Mul(mul) => mul_to_23bit(mul),
         ComputeOp::Shift(shift) => shift_to_23bit(shift),
-        ComputeOp::Multi(_) => None, // multi-function ops stay 48-bit
+        // A float multiply + ALU multifunction has the 32-bit Type 2b form
+        // (the reference assembler `f0 = f2 * f4, f1 = max (f8, f15)` = 01de0183). Other
+        // multifunctions have no 32-bit vendor vector and stay 48-bit.
+        // So does the float multiply + dual add/subtract (all 46 vendor
+        // rows, e.g. `f10 = f0 * f4 , f12 = f8 + f12 , f8 = f8 - f12` =
+        // 01f8ac00). No fixed-point vector exists for either.
+        ComputeOp::Multi(MultiOp::MulAlu { fp: true, .. })
+        | ComputeOp::Multi(MultiOp::MulDualAddSub { fp: true, .. }) => {
+            crate::encode::encode_compute(compute).ok()
+        }
+        ComputeOp::Multi(_) => None,
     }
 }
 
@@ -614,6 +768,7 @@ fn alu_to_23bit(alu: &AluOp) -> Option<u32> {
 
 fn falu_to_23bit(falu: &FaluOp) -> Option<u32> {
     let (opcode, rn, rx, ry): (u8, u16, u16, u16) = match *falu {
+        FaluOp::DualAddSub { rn, rs, rx, ry } if rs < 16 => (0xF0 | rs as u8, rn, rx, ry),
         FaluOp::Add { rn, rx, ry } => (0x81, rn, rx, ry),
         FaluOp::Sub { rn, rx, ry } => (0x82, rn, rx, ry),
         FaluOp::Avg { rn, rx, ry } => (0x89, rn, rx, ry),
@@ -639,6 +794,7 @@ fn falu_to_23bit(falu: &FaluOp) -> Option<u32> {
         FaluOp::Min { rn, rx, ry } => (0xE1, rn, rx, ry),
         FaluOp::Max { rn, rx, ry } => (0xE2, rn, rx, ry),
         FaluOp::Clip { rn, rx, ry } => (0xE3, rn, rx, ry),
+        FaluOp::DualAddSub { .. } => return None,
     };
     if rn > 15 || rx > 15 || ry > 15 {
         return None;
@@ -673,13 +829,17 @@ fn mul_to_23bit(mul: &MulOp) -> Option<u32> {
         MulOp::MrbMulSsf { rx, ry } => (0x7E, 0, rx, ry),
         MulOp::MrfMulUuf { rx, ry } => (0x4C, 0, rx, ry),
         MulOp::MrfMulUui { rx, ry } => (0x44, 0, rx, ry),
+        MulOp::FixedMul { opcode, rn, rx, ry } if opcode >= 0x40 => (opcode, rn, rx, ry),
         MulOp::MacSsf { rn, rx, ry } => (0xB8, rn, rx, ry),
         MulOp::MrfMacSsf { rx, ry } => (0xBC, 0, rx, ry),
         MulOp::MrbMacSsf { rx, ry } => (0xBE, 0, rx, ry),
         MulOp::MrfMsubSsf { rx, ry } => (0xFC, 0, rx, ry),
         MulOp::MrbMsubSsf { rx, ry } => (0xFE, 0, rx, ry),
-        MulOp::SatMrf { rn } => (0x08, rn, 0, 0),
-        MulOp::SatMrb { rn } => (0x0A, rn, 0, 0),
+        // Unsuffixed `Rn = SAT MRF|MRB` is the (SF) form: the reference assembler 01909000 /
+        // 0190b000. 0x08/0x0A are (UF).
+        MulOp::SatMrf { rn } => (0x09, rn, 0, 0),
+        MulOp::SatMrb { rn } => (0x0B, rn, 0, 0),
+        MulOp::MrToReg { opcode, rn } => (opcode, rn, 0, 0),
         MulOp::ClrMrf => (0x14, 0, 0, 0),
         MulOp::ClrMrb => (0x16, 0, 0, 0),
         MulOp::FMul { rn, rx, ry } => (0x30, rn, rx, ry),
@@ -732,6 +892,8 @@ fn shift_to_23bit(shift: &ShiftOp) -> Option<u32> {
         ShiftOp::Lefto { rn, rx } => (0x8C, rn, rx, 0),
         ShiftOp::Fpack { rn, rx } => (0x90, rn, rx, 0),
         ShiftOp::Funpack { rn, rx } => (0x94, rn, rx, 0),
+        ShiftOp::BffwrpRead { rn } => (0x70, rn, 0, 0),
+        ShiftOp::BffwrpWrite { ry } => (0x7C, 0, 0, ry),
         ShiftOp::Bset { rn, rx, ry } => (0xC0, rn, rx, ry),
         ShiftOp::Bclr { rn, rx, ry } => (0xC4, rn, rx, ry),
         ShiftOp::Btgl { rn, rx, ry } => (0xC8, rn, rx, ry),
@@ -806,24 +968,6 @@ mod tests {
     }
 
     #[test]
-    fn modify_with_m_register_is_type_7b_with_its_fixed_bits() {
-        // MODIFY (I5, M2): PRM Figure 14-20 fixes frame bits 22-16 at 0111111. Without them the word reads as a 48-bit Type 7a.
-        let instr = Instruction::DagModify {
-            pm: false,
-            i_reg: 5,
-            m_reg: 2,
-            cond: 31,
-            compute: None,
-        };
-        let isa = encode_isa(&instr);
-        match visa_encode(&instr, &isa) {
-            // p1 = 0000 0100 0 g=0 cond=11111 is[2]=1 -> 0x043F; p2 = is[1:0]=01, m=010, idis=000, 0x3F -> 0x503F
-            VisaEncoded::W32(v) => assert_eq!(v, 0x043F_503F),
-            _ => panic!("expected 32-bit"),
-        }
-    }
-
-    #[test]
     fn short_compute_rn_ne_rx_stays_48() {
         // R3 = R4 + R5: rn != rx, cannot use Type 2c
         let instr = Instruction::Compute {
@@ -860,11 +1004,12 @@ mod tests {
     }
 
     #[test]
-    fn system_uregs_use_swc_numbering() {
-        assert_eq!(visa_ureg_code(0x62), Some(0x63)); // PC
-        assert_eq!(visa_ureg_code(0x70), Some(0x72)); // MODE1
-        assert_eq!(visa_ureg_code(0x71), Some(0x74)); // MODE2
-        assert_eq!(visa_ureg_code(0x73), Some(0x76)); // ASTATx
+    fn system_uregs_keep_the_universal_code() {
+        assert_eq!(visa_ureg_code(0x63), Some(0x63)); // PC
+        assert_eq!(visa_ureg_code(0x72), Some(0x72)); // MODE1
+        assert_eq!(visa_ureg_code(0x76), Some(0x76)); // ASTATx
+        assert_eq!(visa_ureg_code(0x7F), Some(0x7F)); // USTAT4
+        assert_eq!(visa_ureg_code(0x80), None);
     }
 
     #[test]
@@ -872,12 +1017,13 @@ mod tests {
         let instr = Instruction::UregDagMove {
             pm: false,
             write: true,
-            ureg: 0x73,
+            ureg: 0x76,
             i_reg: 6,
             m_reg: 5,
             cond: 31,
             compute: None,
             post_modify: false,
+            width: DagWidth::Normal,
         };
         let isa = encode_isa(&instr);
         assert!(matches!(
@@ -893,7 +1039,7 @@ mod tests {
             i_reg: 6,
             write: true,
             lw: false,
-            ureg: 0x73,
+            ureg: 0x76,
             offset: -1,
         };
         let isa = encode_isa(&instr);
@@ -922,6 +1068,7 @@ mod tests {
             cond: 31,
             target: BranchTarget::Absolute(0x100),
             delayed: false,
+            loop_abort: false,
         };
         let isa = encode_isa(&instr);
         let result = visa_encode(&instr, &isa);
@@ -936,5 +1083,26 @@ mod tests {
             VisaEncoded::W32(0x12345678).to_bytes(),
             vec![0x12, 0x34, 0x56, 0x78]
         );
+    }
+
+    // Ported from ElekLabs/selache fix/encodings (Em D).
+    #[test]
+    fn modify_with_m_register_is_type_7b_with_its_fixed_bits() {
+        // MODIFY (I5, M2): PRM Figure 14-20 fixes frame bits 22-16 at 0111111. Without them the word reads as a 48-bit Type 7a.
+        let instr = Instruction::DagModify {
+            pm: false,
+            dest_xor: 0,
+            i_reg: 5,
+            m_reg: 2,
+            cond: 31,
+            compute: None,
+            width: MemWidth::Normal,
+        };
+        let isa = encode_isa(&instr);
+        match visa_encode(&instr, &isa) {
+            // p1 = 0000 0100 0 g=0 cond=11111 is[2]=1 -> 0x043F; p2 = is[1:0]=01, m=010, idis=000, 0x3F -> 0x503F
+            VisaEncoded::W32(v) => assert_eq!(v, 0x043F_503F),
+            _ => panic!("expected 32-bit"),
+        }
     }
 }

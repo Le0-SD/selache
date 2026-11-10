@@ -850,6 +850,36 @@ PROCESSOR core0 {
 }
 
 #[test]
+fn vendor_six_byte_sw_patch_slot_fits_exactly() {
+    // seg_p_slot contains one six-byte JUMP. The linker script gives it
+    // exactly 0x3859fe..=0x385a03; the vendor DXE occupies all six bytes.
+    let work = make_workdir("six_byte_sw_slot");
+    let code = [0x06, 0x3e, 0, 0, 0, 0];
+    let mut writer = selelf::elf_write::ElfWriter::new();
+    writer.add_text_section_sw("seg_p_slot", &code);
+    write_file(&work, "slot.doj", &writer.finish());
+    write_text(
+        &work,
+        "test.ldf",
+        r#"ARCHITECTURE(ADSP-21569)
+MEMORY { mem_ps { TYPE(BW RAM) START(0x003859fe) END(0x00385a03) WIDTH(8) } }
+PROCESSOR p0 {
+    OUTPUT($COMMAND_LINE_OUTPUT_FILE)
+    SECTIONS { seg_p_slot SW { INPUT_SECTIONS($COMMAND_LINE_OBJECTS(seg_p_slot)) } > mem_ps }
+}
+"#,
+    );
+    let (rc, _, err) = run_seld(&["-T", "test.ldf", "-o", "out.dxe", "slot.doj"], &work);
+    assert_eq!(rc, 0, "{err}");
+    let bytes = std::fs::read(work.join("out.dxe")).unwrap();
+    let header = parse_elf_header(&bytes).unwrap();
+    let sections = parse_section_headers(&bytes, &header);
+    assert_eq!((sections[1].sh_addr, sections[1].sh_size), (0x1c2cff, 6));
+    let offset = sections[1].sh_offset as usize;
+    assert_eq!(bytes[offset..offset + 6], code);
+}
+
+#[test]
 fn verbose_flag_produces_progress_output() {
     let work = make_workdir("verbose");
     write_main_doj(&work, &[0u8; 24]);

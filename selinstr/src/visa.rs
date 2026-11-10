@@ -190,34 +190,7 @@ fn compact_isa_output(s: &str) -> String {
         }
     }
     // Ensure "dm(" and "pm(" have a space: "dm (" and "pm ("
-    let mut result = result.replace("dm(", "dm (").replace("pm(", "pm (");
-    // Remap ISA ureg names to VISA equivalents:
-    // ISA 0x64=PCSTKP -> VISA PCSTK (but don't break existing "pcstk")
-    // ISA 0x72=FLAGS -> VISA MODE1 (standalone word only, not flag0_in etc.)
-    result = result.replace("pcstkp", "pcstk");
-    // Replace "flags" only as a standalone ureg name (preceded by = or , or space)
-    // Simple approach: FLAGS only appears as a register destination/source
-    visa_replace_ureg(&mut result, "flags", "mode1");
-    result
-}
-
-/// Replace a standalone ureg name in disassembly output.
-/// Only matches when bounded by non-alphanumeric characters.
-fn visa_replace_ureg(s: &mut String, old: &str, new: &str) {
-    let mut start = 0;
-    while let Some(pos) = s[start..].find(old) {
-        let abs_pos = start + pos;
-        let end_pos = abs_pos + old.len();
-        // Check boundaries: must not be preceded or followed by alphanumeric/underscore
-        let before_ok = abs_pos == 0 || !s.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
-        let after_ok = end_pos >= s.len() || !s.as_bytes()[end_pos].is_ascii_alphanumeric();
-        if before_ok && after_ok {
-            s.replace_range(abs_pos..end_pos, new);
-            start = abs_pos + new.len();
-        } else {
-            start = end_pos;
-        }
-    }
+    result.replace("dm(", "dm (").replace("pm(", "pm (")
 }
 
 // ---------------------------------------------------------------------------
@@ -234,25 +207,43 @@ fn read_16_be(data: &[u8]) -> u16 {
 /// Covers all VISA instruction forms.
 fn is_16bit(parcel: u16) -> bool {
     // Known exact values
-    if matches!(parcel, 0x0001 | 0x0081 | 0x00C1 | 0x1901 | 0x0AFE) {
+    if matches!(parcel, 0x0001 | 0x0081 | 0x00C1 | 0x1901) {
+        return true;
+    }
+    // RTS/RTI: 0000 101X 1D cccc cL (the reference assembler `rti (db)` = 0bfe, which
+    // this used to frame as the start of a 48-bit word; `if ne rts (lr)`
+    // = 0aa1). A 48-bit RTS/RTI keeps bit 7 of its first parcel clear.
+    if parcel & 0xFE80 == 0x0A80 {
         return true;
     }
     // Type 2c (short compute): bits[15:13] = 110
     if parcel >> 13 == 0b110 {
         return true;
     }
-    // Type 3c (short data move): bits[15:12]=1001, bit8=1, bit4=1
-    if (parcel & 0xF110) == 0x9110 {
+    // Type 3c (short data move): bits[15:12]=1001, bit4=1.
+    // Bit 8 belongs to the modify-register field, including M0-M3.
+    if (parcel & 0xF010) == 0x9010 {
         return true;
     }
     false
+}
+
+/// The 32-bit marker in the second parcel of Types 1, 3, 4/5, 7 and 9:
+/// word bits 22:19 = 0111, i.e. a single-function compute field with the
+/// reserved CU = 11 and opcode bit 19 set. Every the reference assembler 32-bit form we
+/// hold ends 0x3f (normal), 0x3c (short or byte word, Type 3b) or 0x38
+/// (byte word, Type 4b). A multifunction compute sets bit 22, so a 48-bit
+/// float multiply + dual add/sub with Fs = f8..f15 (bits 21:16 = 0x38..0x3f)
+/// is not a marker.
+fn is_32bit_marker(parcel2: u16) -> bool {
+    parcel2 & 0x78 == 0x38
 }
 
 /// Determine VISA instruction width from the first two parcels.
 ///
 /// Uses type-specific rules derived from the SHARC+ instruction decode tree.
 /// For types that exist in both 32 and 48-bit form with the same first-parcel
-/// value, uses `p2 & 0x3F >= 0x38` to distinguish.
+/// value, uses the second parcel's marker (`is_32bit_marker`) to distinguish.
 fn visa_width(parcel1: u16, parcel2: u16) -> InstrWidth {
     if is_16bit(parcel1) {
         return InstrWidth::W16;
@@ -278,15 +269,19 @@ fn visa_width(parcel1: u16, parcel2: u16) -> InstrWidth {
             | 0b10110 // Type 19 (MODIFY/BITREV imm32)
             | 0b10111 // Type 20 (push/pop/flush)
             | 0b11000 // Type 25a (CJUMP)
+            | 0b11010 // Type 14b read (absolute address with a width)
+            | 0b11011 // Type 14b write
             => InstrWidth::W48,
             _ if (sub5 >> 2) == 0b100 => InstrWidth::W48, // Type 14a/d
             // Type 2: sub5=00001, bit7=1→32b, bit7=0→48b
             0b00001 => {
                 if bit7 == 1 { InstrWidth::W32 } else { InstrWidth::W48 }
             }
-            // Type 7: sub5=00100, bit7=0→32b, bit7=1→48b (reversed!)
+            // Type 7: the second parcel's low six bits are the 32-bit marker;
+            // p1 bit 7 is the (NW) flag. The reference assembler: 043e603f is 32-bit,
+            // 043e61000000 and 043e611308a7 are 48-bit.
             0b00100 => {
-                if bit7 == 0 { InstrWidth::W32 } else { InstrWidth::W48 }
+                if is_32bit_marker(parcel2) { InstrWidth::W32 } else { InstrWidth::W48 }
             }
             // Type 17: sub5=01111, bit7=1→32b, bit7=0→48b
             0b01111 => {
@@ -295,7 +290,7 @@ fn visa_width(parcel1: u16, parcel2: u16) -> InstrWidth {
             // Type 9a: sub5=01000, ambiguous → p2 check
             // Type 9b: sub5=01001, ambiguous → p2 check
             _ => {
-                if parcel2 & 0x3F >= 0x38 {
+                if is_32bit_marker(parcel2) {
                     InstrWidth::W32
                 } else {
                     InstrWidth::W48
@@ -306,7 +301,7 @@ fn visa_width(parcel1: u16, parcel2: u16) -> InstrWidth {
             // Type 1: bit7=1→32b (Type 1b), bit7=0→48b (Type 1a)
             // Actually Type 1 always has compute in 48-bit form.
             // Check p2 for ambiguous values.
-            if parcel2 & 0x3F >= 0x38 {
+            if is_32bit_marker(parcel2) {
                 InstrWidth::W32
             } else {
                 InstrWidth::W48
@@ -314,28 +309,23 @@ fn visa_width(parcel1: u16, parcel2: u16) -> InstrWidth {
         }
         0b010 => {
             // Type 3: has 3a (48), 3b (32), 3d (48) variants
-            // sub5=11001: bit7=1→32, bit7=0→48
-            if sub5 == 0b11001 {
-                if bit7 == 1 {
-                    InstrWidth::W32
-                } else {
-                    InstrWidth::W48
-                }
-            } else if parcel2 & 0x3F >= 0x38 {
+            // The Type 3b marker also applies to post-modify I4 accesses
+            // (sub5=11001), including M4/M5 where bit7 is clear.
+            // The second parcel's low six bits are the 32-bit marker
+            // (0x3f normal word, 0x3c short/byte word). The reference assembler 48-bit
+            // forms with the same first parcel: `r2 = dm(i4, m6)` =
+            // 59be01000000, `r0=dm(i4,m6)(sw)` = 59be40300000.
+            if is_32bit_marker(parcel2) {
                 InstrWidth::W32
             } else {
                 InstrWidth::W48
             }
         }
         0b011 => {
-            // Types 4, 5: sub5=01010 bit0=0→32, bit0=1→48
-            if sub5 == 0b01010 {
-                if parcel1 & 1 == 0 {
-                    InstrWidth::W32
-                } else {
-                    InstrWidth::W48
-                }
-            } else if parcel2 & 0x3F >= 0x38 {
+            // Types 4, 5: the second parcel's low six bits are the 32-bit
+            // marker (the reference assembler: 6a7e113f is 32-bit, 6a7e11000000 and
+            // 6a7e11588f83 are 48-bit with the same first parcel).
+            if is_32bit_marker(parcel2) {
                 InstrWidth::W32
             } else {
                 InstrWidth::W48
@@ -348,18 +338,13 @@ fn visa_width(parcel1: u16, parcel2: u16) -> InstrWidth {
                 // Type 6a: shift + mem (always 48-bit)
                 InstrWidth::W48
             } else {
-                // bit12=1: Type 16a (48-bit) or Type 3b/16b (32-bit)
-                // Type 16a (48-bit, dm/pm with imm32): p1=0x9fc0 pattern
-                // 0x9fc0 is the only 48-bit p1 with bit12=1 in this
-                // group. It has bit7=1, bit2=0. The 32-bit 0x9fc4 has bit2=1.
-                // Use sub5=11111 special handling, else 32-bit.
-                if sub5 == 0b11111 {
-                    let b2 = (parcel1 >> 2) & 1;
-                    if b2 == 0 && bit7 == 1 {
-                        InstrWidth::W48 // Type 16a with imm32
-                    } else {
-                        InstrWidth::W32
-                    }
+                // bit12=1: Type 16a (48-bit, p1 bits 4:0 = 0) or the
+                // 32-bit Type 15b/16b (bits 4:0 = 01000 / 00100). Holds
+                // for all 2,165 such reference assembler rows: 48-bit
+                // `dm(i2, m0) = 0x1c0111` = 9400001c0111, 32-bit
+                // `pm ( i10 , m8 ) = 0x0` = 94240000.
+                if parcel1 & 0x1F == 0 {
+                    InstrWidth::W48
                 } else {
                     InstrWidth::W32
                 }
@@ -381,7 +366,21 @@ fn decode_16(parcel: u16) -> String {
         0x0001 => return "nop".into(),
         0x0081 => return "idle".into(),
         0x00C1 => return "emuidle".into(),
-        0x0AFE => return "rts (db)".into(),
+        p if p & 0xFE80 == 0x0A80 => {
+            let op = if p & 0x0100 != 0 { "rti" } else { "rts" };
+            let db = match (p & 0x40 != 0, p & 1 != 0) {
+                (true, true) => " (db,lr)",
+                (true, false) => " (db)",
+                (false, true) => " (lr)",
+                (false, false) => "",
+            };
+            let cond = (p >> 1) & 0x1F;
+            return if cond == 31 {
+                format!("{op}{db}")
+            } else {
+                format!("if {} {op}{db}", cond_name_lower(cond))
+            };
+        }
         0x1901 => return "rframe".into(),
         _ => {}
     }
@@ -389,7 +388,7 @@ fn decode_16(parcel: u16) -> String {
     if parcel >> 13 == 0b110 {
         return decode_type2c(parcel);
     }
-    if (parcel & 0xF110) == 0x9110 {
+    if (parcel & 0xF010) == 0x9010 {
         return decode_type3c(parcel);
     }
 
@@ -424,9 +423,12 @@ fn decode_short_compute(parcel: u16) -> String {
         4 => format!("r{rn}=not r{ry}"),
         5 => format!("r{rn}=r{ry}+1"),
         6 => format!("r{rn}=r{ry}-1"),
-        7 => format!("r{rn}=r{rn}+r{ry}+ci"),
+        // The reference assembler `r0 = r0 * r1 (ssi)` = c701; `r0 = r0 + r1 + ci` has
+        // no 16-bit form (01805001).
+        7 => format!("r{rn}=r{rn}*r{ry} (ssi)"),
         8 => format!("f{rn}=f{rn}+f{ry}"),
         9 => format!("f{rn}=f{rn}-f{ry}"),
+        10 => format!("f{rn}=float r{ry}"),
         11 => format!("comp (f{rn},f{ry})"),
         12 => format!("r{rn}=r{rn} and r{ry}"),
         13 => format!("r{rn}=r{rn} or r{ry}"),
@@ -437,21 +439,8 @@ fn decode_short_compute(parcel: u16) -> String {
 }
 
 /// Type 3c: short data move (16-bit).
-/// bits[15:12]=1001, bit[8]=1, bit[4]=1, variable fields between.
+/// bits[15:12]=1001, bit[4]=1, variable register fields between.
 fn decode_type3c(parcel: u16) -> String {
-    // Bit layout:
-    // bits[15:12] = 1001 (fixed type marker)
-    // bits[11:9]  = i[2:0] (index register: I0-I7 for DM)
-    // bits[8]     = 1 (fixed)
-    // bits[7:5]   = m[2:0] (modify register: M0-M7 for DM)
-    // bit[4]      = 1 (fixed)
-    // bit[3]      = d (0=read from mem, 1=write to mem)
-    // bits[2:0]   = dreg[3:1,0] (register number)
-    //
-    // Note: dreg encoding packs 4 bits across bits[6:3] in the original
-    // Note: dreg encoding packs 4 bits across non-contiguous fields.
-    //
-
     // Bit layout:
     //   bits[11:9] = i[2:0] (index register)
     //   bits[8:6]  = m[2:0] (modify register)
@@ -488,6 +477,12 @@ fn decode_32(word: u32) -> String {
 
     match top3 {
         0b000 => decode_32_group0(p1, p2),
+        // Type 1 (dual move): the 48-bit word with an empty compute and the
+        // marker in its place (`dm ( i0 , m0 ) = r4 , pm ( i8 , m10 ) =
+        // r8` = 3028143f, 48-bit 302814000000).
+        0b001 => compact_isa_output(&crate::disasm::decode_instruction(
+            u64::from(word & !0x3F) << 16,
+        )),
         0b010 => decode_32_type3b(p1, p2),
         0b011 => decode_32_group3(p1, p2),
         0b100 => decode_32_group4(p1, p2),
@@ -504,7 +499,8 @@ fn decode_32_group0(p1: u16, p2: u16) -> String {
     match sub5 {
         0b00001 => decode_32_type2b(p1, p2),
         0b00100 => decode_32_type7b(p1, p2),
-        0b01000 | 0b01001 => decode_32_type9b(p1, p2),
+        0b01000 => decode_32_type9a(p1, p2),
+        0b01001 => decode_32_type9b(p1, p2),
         0b01111 => decode_32_type17b(p1, p2),
         _ => format!("??? 0x{p1:04x} 0x{p2:04x}"),
     }
@@ -569,6 +565,12 @@ fn decode_32_compute(field: u32) -> String {
         0 => decode_32_alu(opcode, rn, rx, ry),
         1 => decode_32_mul(opcode, rn, rx, ry),
         2 => decode_32_shift(opcode, rn, rx, ry),
+        // A multifunction field (bit 22, CU = 11): print it through the
+        // 48-bit decoder as an unconditional Type 2 word (the reference assembler `f10 = f0
+        // * f4 , f12 = f8 + f12 , f8 = f8 - f12` = 01f8ac00).
+        _ if field & (1 << 22) != 0 => compact_isa_output(&crate::disasm::decode_instruction(
+            (0x01u64 << 40) | (31u64 << 33) | u64::from(field),
+        )),
         _ => format!("compute(0x{field:06x})"),
     }
 }
@@ -662,6 +664,7 @@ fn decode_32_mul(opcode: u8, rn: u32, rx: u32, ry: u32) -> String {
         0xBE => format!("mrb=mrb+r{rx}*r{ry} (ssf)"),
         0xFC => format!("mrf=mrf-r{rx}*r{ry} (ssf)"),
         0xFE => format!("mrb=mrb-r{rx}*r{ry} (ssf)"),
+        0x40..=0xFF => crate::disasm::decode_fixed_mul(opcode, rn, rx, ry).to_lowercase(),
         _ => format!("mul 0x{opcode:02x} r{rn} r{rx} r{ry}"),
     }
 }
@@ -687,6 +690,8 @@ fn decode_32_shift(opcode: u8, rn: u32, rx: u32, ry: u32) -> String {
         0xC4 => format!("r{rn}=bclr r{rx} by r{ry}"),
         0xC8 => format!("r{rn}=btgl r{rx} by r{ry}"),
         0xCC => format!("btst r{rx} by r{ry}"),
+        0x70 => format!("r{rn}=bffwrp"),
+        0x7C => format!("bffwrp=r{ry}"),
         _ => format!("shift 0x{opcode:02x} r{rn} r{rx} r{ry}"),
     }
 }
@@ -721,6 +726,30 @@ fn decode_32_type7b(p1: u16, p2: u16) -> String {
         out.push(' ');
     }
     out.push_str(&format!("i{dst}=modify (i{src},m{m})"));
+    out
+}
+
+/// Type 9a: 32-bit indirect jump/call, the top of the 48-bit word with the
+/// 0x3f marker: CALL p1[7], cond p1[5:1], I = 8 + {p1[0], p2[15:14]},
+/// M = 8 + p2[13:11], (DB) p2[10]. The reference assembler: `call (m14, i12)` = 08bf303f,
+/// `if lt jump (m14, i8) (db)` = 0802343f.
+fn decode_32_type9a(p1: u16, p2: u16) -> String {
+    let j = (p1 >> 7) & 1;
+    let cond = (p1 >> 1) & 0x1F;
+    let i = 8 + (((p1 & 1) << 2) | ((p2 >> 14) & 3));
+    let m = 8 + ((p2 >> 11) & 7);
+    let db = (p2 >> 10) & 1;
+    let op = if j == 1 { "call" } else { "jump" };
+    let mut out = String::new();
+    if cond != 31 {
+        out.push_str("if ");
+        out.push_str(&cond_name_lower(cond));
+        out.push(' ');
+    }
+    out.push_str(&format!("{op} (m{m},i{i})"));
+    if db == 1 {
+        out.push_str(" (db)");
+    }
     out
 }
 
@@ -778,7 +807,8 @@ fn decode_32_type17b(p1: u16, p2: u16) -> String {
 /// Type 3b: ureg transfer with register modify.
 ///
 /// Layout:
-///   - `p1[12:9]` = i-register index (I0-I7 for DM, I8-I15 for PM)
+///   - `p1[12]`   = post-modify (0=pre-modify, 1=post-modify)
+///   - `p1[11:9]` = i-register index (I0-I7 for DM)
 ///   - `p1[7:6]`  = m-register offset (m = field + 4, giving M4-M7)
 ///   - `p1[5:1]`  = cond (5 bits)
 ///   - `p2[15]`   = direction (0=read, 1=write)
@@ -786,50 +816,38 @@ fn decode_32_type17b(p1: u16, p2: u16) -> String {
 ///   - `p2[13:7]` = ureg code (7 bits)
 ///   - `p2[1:0]`  = access width (11=NW, 00=BW or SW depending on p2[14])
 fn decode_32_type3b(p1: u16, p2: u16) -> String {
-    let sub5 = (p1 >> 8) & 0x1F;
-    let i_field = (p1 >> 9) & 0xF;
-    let m_offset = (p1 >> 6) & 3;
+    let post_modify = p1 & 0x1000 != 0;
+    let i_field = (p1 >> 9) & 7;
+    // M is three bits (p1 8:6) and p1 bit 0 is G (PM, DAG2): the reference assembler
+    // `curlcntr = dm ( i4 , m2 )` = 58be33bf, `pm(i8, m10) = f4` =
+    // 50bf823f. M used to be read as two bits plus 4.
+    let m_field = (p1 >> 6) & 7;
+    let pm = p1 & 1 == 1;
+    let dag = if pm { 8 } else { 0 };
     let cond = (p1 >> 1) & 0x1F;
     let d = (p2 >> 15) & 1; // 0=read, 1=write
     let sw_flag = (p2 >> 14) & 1;
     let ureg_code = ((p2 >> 7) & 0x7F) as u32;
     let width_bits = p2 & 3;
 
-    // Determine memory space (DM for now)
-    let mem = "dm";
-    let i_val = i_field & 7;
-    let i_reg = format!("i{i_val}");
-    let m_val = m_offset + 4;
-    let m_reg = format!("m{m_val}");
+    let mem = if pm { "pm" } else { "dm" };
+    let i_reg = format!("i{}", i_field + dag);
+    let m_reg = format!("m{}", m_field + dag);
     let ur = ureg_name_lower(ureg_code);
 
-    // Access width suffix (Type 3b): sw_flag=1 → short-word, sw_flag=0 → byte-word
-    let suffix = if width_bits == 0 {
-        if sw_flag == 1 {
-            "(sw)"
-        } else {
-            "(bw)"
-        }
-    } else {
-        "" // normal word, no suffix
+    // Access width: p2[1:0] 11 normal/long, 00 short/byte, 01 sign-extended
+    // short/byte; p2[14] picks long/short (the reference assembler 513e403f `(lw)`,
+    // 503e403c `(sw)`, 503e003c `(bw)`, 503e403d `(swse)`, 51be00bd
+    // `(bwse)`).
+    let suffix = match (width_bits, sw_flag) {
+        (3, 0) => "",
+        (3, _) => "(lw)",
+        (0, 1) => "(sw)",
+        (0, _) => "(bw)",
+        (1, 1) => "(swse)",
+        (1, _) => "(bwse)",
+        _ => "(?)",
     };
-
-    // sub5=11001: system register transfers (LADDR, CURLCNTR, etc.)
-    // Same field layout as normal Type 3b but no access width suffix
-    if sub5 == 0b11001 {
-        let mut out = String::new();
-        if cond != 31 {
-            out.push_str("if ");
-            out.push_str(&cond_name_lower(cond));
-            out.push(' ');
-        }
-        if d == 1 {
-            out.push_str(&format!("{mem} ({i_reg},{m_reg})={ur}"));
-        } else {
-            out.push_str(&format!("{ur}={mem} ({i_reg},{m_reg})"));
-        }
-        return out;
-    }
 
     let mut out = String::new();
     if cond != 31 {
@@ -838,21 +856,20 @@ fn decode_32_type3b(p1: u16, p2: u16) -> String {
         out.push(' ');
     }
 
+    let address = if post_modify {
+        format!("{i_reg},{m_reg}")
+    } else {
+        format!("{m_reg},{i_reg}")
+    };
     if d == 1 {
-        // Write: dm(Mm,Ii)=ureg
-        if suffix.is_empty() {
-            out.push_str(&format!("{mem} ({m_reg},{i_reg})={ur}"));
-        } else {
-            out.push_str(&format!("{mem} ({m_reg},{i_reg})={ur} {suffix}"));
+        out.push_str(&format!("{mem} ({address})={ur}"));
+        if !suffix.is_empty() {
+            out.push(' ');
         }
     } else {
-        // Read: ureg=dm(Mm,Ii)
-        if suffix.is_empty() {
-            out.push_str(&format!("{ur}={mem} ({m_reg},{i_reg})"));
-        } else {
-            out.push_str(&format!("{ur}={mem} ({m_reg},{i_reg}){suffix}"));
-        }
+        out.push_str(&format!("{ur}={mem} ({address})"));
     }
+    out.push_str(suffix);
     out
 }
 
@@ -869,10 +886,11 @@ fn decode_32_group3(p1: u16, p2: u16) -> String {
         return decode_32_ureg_move(p1, p2);
     }
 
-    // Other sub5 values: Type 4b (dreg<->DM|PM with immediate)
-    match sub5 {
-        0b01000 | 0b01010 | 0b01100 => decode_32_type4b(p1, p2),
-        _ => format!("??? type4b 0x{p1:04x} 0x{p2:04x}"),
+    // Type 4b: sub5 = 0 iii G (p1[12] = 0, I at p1[11:9], p1[8] = PM).
+    if sub5 & 0b10000 == 0 {
+        decode_32_type4b(p1, p2)
+    } else {
+        format!("??? type4b 0x{p1:04x} 0x{p2:04x}")
     }
 }
 
@@ -907,16 +925,21 @@ fn decode_32_ureg_move(p1: u16, p2: u16) -> String {
 /// Type 4b: 32-bit dreg <-> DM|PM with immediate offset.
 ///
 /// Layout:
-///   - `p1[12:9]`  = i-register index
-///   - `p1[10]`    = direction (0=read, 1=write)
+///   - `p1[11:9]`  = i-register index
+///   - `p1[7]`     = direction (0=read, 1=write)
+///   - `p1[6]`     = post-modify (1 = dm(Ii, offset))
 ///   - `p1[5:1]`   = cond (5 bits)
 ///   - `p2[15:11]` = offset (5-bit unsigned)
 ///   - `p2[10:7]`  = dreg (4-bit register index)
 ///   - `p2[2]`     = access width (1=SW, 0=BW)
 ///   - `p2[1:0]`   = width mode (00=sub-word, 11=normal word)
 fn decode_32_type4b(p1: u16, p2: u16) -> String {
-    let i_field = (p1 >> 9) & 0xF;
-    let d_bit = (p1 >> 10) & 1;
+    // p1 is the top parcel of the 48-bit Type 4 word: d at p1[7]. The reference assembler
+    // `if sz r15=dm(-3,i6)` = 6c11efbf is a read with p1[10] set by I6.
+    // p1[8] = G, PM through DAG2 (`r0 = pm ( i8 , 0x0 )` = 617e003f).
+    let pm = (p1 >> 8) & 1 == 1;
+    let i_field = ((p1 >> 9) & 0x7) + if pm { 8 } else { 0 };
+    let d_bit = (p1 >> 7) & 1;
     let cond = (p1 >> 1) & 0x1F;
 
     let dreg_val = ((p2 >> 7) & 0xF) as u32;
@@ -926,14 +949,13 @@ fn decode_32_type4b(p1: u16, p2: u16) -> String {
 
     let width_bits = p2 & 3;
     let sw_bit = (p2 >> 2) & 1;
-    let suffix = if width_bits == 0 {
-        if sw_bit == 1 {
-            "(sw)"
-        } else {
-            "(bw)"
-        }
-    } else {
-        ""
+    // 01 = sign-extending (`( swse )` 687e103d, `( bwse )` 643fd839).
+    let suffix = match (width_bits, sw_bit) {
+        (0, 1) => "(sw)",
+        (0, _) => "(bw)",
+        (1, 1) => "(swse)",
+        (1, _) => "(bwse)",
+        _ => "",
     };
 
     // Operand order depends on p1[6]:
@@ -947,7 +969,7 @@ fn decode_32_type4b(p1: u16, p2: u16) -> String {
         format!("0x{:x}", offset as u32)
     };
 
-    let mem = "dm";
+    let mem = if pm { "pm" } else { "dm" };
     let mut out = String::new();
     if cond != 31 {
         out.push_str("if ");
@@ -982,23 +1004,25 @@ fn decode_32_type4b(p1: u16, p2: u16) -> String {
 // ---------------------------------------------------------------------------
 
 fn decode_32_group4(p1: u16, p2: u16) -> String {
-    let i_field = (p1 >> 9) & 7;
+    // p1 bit 5 is G: PM through DAG2 (I8-I15, M8-M15).
+    let pm = (p1 >> 5) & 1 == 1;
+    let mem = if pm { "pm" } else { "dm" };
+    let dag = if pm { 8 } else { 0 };
+    let i_field = ((p1 >> 9) & 7) + dag;
     let d_bit = (p1 >> 8) & 1;
     let lw_flag = (p1 >> 7) & 1;
 
-    // Detect Type 16b: dm(Ii,Mm)=imm16
-    // These have p1[2]=1 (bit2) and specific patterns
-    let bit2 = (p1 >> 2) & 1;
-    if bit2 == 1 && ((p1 & 0x0F) == 0x04 || (p1 & 0x0F) == 0x08) {
-        // Type 16b: dm(Ii,Mm)=imm16
-        // M register encoding is uncertain; use approximate decode
-        let m_approx = if lw_flag == 1 {
-            i_field
+    // Type 16b: DM|PM(Ii, Mm) = imm16, p1 bits 4:0 = 00100. The reference assembler:
+    // `dm ( i7 , m7 ) = 0x1000` = 9fc41000, `pm ( i10 , m8 ) = 0x0` =
+    // 94240000, `dm(i0, m0) = -0x1` = 9004ffff.
+    if p1 & 0x1F == 0x04 {
+        let m_field = ((p1 >> 6) & 7) + dag;
+        let imm = p2 as i16;
+        return if imm < 0 {
+            format!("{mem} (i{i_field},m{m_field})=-0x{:x}", -i32::from(imm))
         } else {
-            i_field.wrapping_add(2) & 7
+            format!("{mem} (i{i_field},m{m_field})=0x{imm:x}")
         };
-        let imm = p2;
-        return format!("dm (i{i_field},m{m_approx})=0x{imm:x}");
     }
 
     // Standard: ureg <-> dm(offset, Ii)
@@ -1018,30 +1042,30 @@ fn decode_32_group4(p1: u16, p2: u16) -> String {
         // Write: dm(offset, Ii)=ureg
         if offset < 0 {
             if suffix.is_empty() {
-                format!("dm (-0x{:x},i{i_field})={ur}", -offset)
+                format!("{mem} (-0x{:x},i{i_field})={ur}", -offset)
             } else {
-                format!("dm (-0x{:x},i{i_field})={ur} {suffix}", -offset)
+                format!("{mem} (-0x{:x},i{i_field})={ur} {suffix}", -offset)
             }
         } else {
             if suffix.is_empty() {
-                format!("dm (0x{offset:x},i{i_field})={ur}")
+                format!("{mem} (0x{offset:x},i{i_field})={ur}")
             } else {
-                format!("dm (0x{offset:x},i{i_field})={ur} {suffix}")
+                format!("{mem} (0x{offset:x},i{i_field})={ur} {suffix}")
             }
         }
     } else {
         // Read: ureg=dm(offset, Ii)
         if offset < 0 {
             if suffix.is_empty() {
-                format!("{ur}=dm (-0x{:x},i{i_field})", -offset)
+                format!("{ur}={mem} (-0x{:x},i{i_field})", -offset)
             } else {
-                format!("{ur}=dm (-0x{:x},i{i_field}){suffix}", -offset)
+                format!("{ur}={mem} (-0x{:x},i{i_field}){suffix}", -offset)
             }
         } else {
             if suffix.is_empty() {
-                format!("{ur}=dm (0x{offset:x},i{i_field})")
+                format!("{ur}={mem} (0x{offset:x},i{i_field})")
             } else {
-                format!("{ur}=dm (0x{offset:x},i{i_field}){suffix}")
+                format!("{ur}={mem} (0x{offset:x},i{i_field}){suffix}")
             }
         }
     }
@@ -1058,33 +1082,7 @@ fn decode_32_group4(p1: u16, p2: u16) -> String {
 ///   - group 3: L0-L15     group 4: B0-B15   group 5: S0-S15
 ///   - groups 6-7: system registers (FADDR, PC, MODE1, etc.)
 fn ureg_name_lower(code: u32) -> String {
-    let group = (code >> 4) & 0xF;
-    let reg = code & 0xF;
-    match group {
-        0x0 => format!("r{reg}"),
-        0x1 => format!("i{reg}"),
-        0x2 => format!("m{reg}"),
-        0x3 => format!("l{reg}"),
-        0x4 => format!("b{reg}"),
-        0x5 => format!("s{reg}"),
-        // Groups 6-7: the 32-bit VISA ureg encoding differs from the 48-bit ISA.
-        // Known mapping.
-        0x6 => visa_ureg_group6(reg),
-        0x7 => visa_ureg_group7(reg),
-        0x8 => match reg {
-            0x0 => "ustat1".into(),
-            0x1 => "ustat2".into(),
-            0x2 => "ustat3".into(),
-            0x3 => "ustat4".into(),
-            _ => format!("ureg(0x{code:02x})"),
-        },
-        0x9 => match reg {
-            0x0 => "tperiod".into(),
-            0x1 => "tcount".into(),
-            _ => format!("ureg(0x{code:02x})"),
-        },
-        _ => format!("ureg(0x{code:02x})"),
-    }
+    crate::disasm::ureg_name(code).to_lowercase()
 }
 
 /// Lowercase condition name.
@@ -1126,50 +1124,87 @@ fn cond_name_lower(code: u16) -> String {
     }
 }
 
-/// Group 6 system register names in the 32-bit VISA ureg encoding.
-///
-/// The 32-bit encoding differs from the 48-bit ISA: PC and the following
-/// PC-stack/loop registers are shifted, while PX registers use compact
-/// indices starting at 0xB.
-fn visa_ureg_group6(reg: u32) -> String {
-    match reg {
-        0x0 => "faddr".into(),
-        0x1 => "daddr".into(),
-        0x3 => "pc".into(),
-        0x4 => "pcstk".into(),
-        0x5 => "pcstkp".into(),
-        0x6 => "laddr".into(),
-        0x7 => "curlcntr".into(),
-        0x8 => "lcntr".into(),
-        0x9 => "emuclk".into(),
-        0xA => "emuclk2".into(),
-        0xB => "px".into(),
-        0xC => "px1".into(),
-        0xD => "px2".into(),
-        _ => format!("ureg(0x{:02x})", 0x60 | reg),
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Group 7 system register names in the 32-bit VISA ureg encoding.
-///
-/// The 32-bit encoding uses the compact SW/VISA numbering, not the 48-bit ISA
-/// ureg values carried by parsed instructions.
-fn visa_ureg_group7(reg: u32) -> String {
-    match reg {
-        0x0 => "mode1".into(),
-        0x1 => "mode2".into(),
-        0x2 => "mode1".into(), // 0x72 -> mode1
-        0x3 => "mode2".into(),
-        0x4 => "mode2".into(),
-        0x5 => "flags".into(),
-        0x6 => "astatx".into(),
-        0x7 => "astaty".into(),
-        0x8 => "stkyx".into(),
-        0x9 => "stkyy".into(),
-        0xA => "irptl".into(),
-        0xB => "imask".into(),
-        0xC => "imaskp".into(),
-        0xD => "mode1stk".into(), // 0x7D -> mode1stk
-        _ => format!("ureg(0x{:02x})", 0x70 | reg),
+    #[test]
+    fn short_data_moves_preserve_vendor_stream_boundaries() {
+        // The reference assembler: the M0 load
+        // is one parcel, followed by NOP, a 32-bit shift, and a 48-bit
+        // immediate load. Requiring bit 8 swallowed the following NOP.
+        let code = [
+            0x01, 0x80, 0x14, 0x01, 0xc0, 0x01, 0x0f, 0x82, 0x12, 0x34, 0x90, 0x14, 0x00, 0x01,
+            0x01, 0xa0, 0x04, 0x01, 0x0f, 0x03, 0x12, 0x34, 0x56, 0x78, 0x0a, 0xbe,
+        ];
+        let lines = disassemble_visa(&code, 0, crate::disasm::decode_instruction);
+        let expected = [
+            (0, 4),
+            (2, 2),
+            (3, 4),
+            (5, 2),
+            (6, 2),
+            (7, 4),
+            (9, 6),
+            (12, 2),
+        ];
+        assert_eq!(lines.len(), expected.len());
+        for (line, (addr, len)) in lines.iter().zip(expected) {
+            assert_eq!((line.addr, line.raw.len()), (addr, len));
+            assert_eq!(instruction_len(&code, addr as usize * 2), len);
+        }
+        assert_eq!(lines[3].text, "r4=dm (i0,m0)");
+        assert_eq!(lines[4].text, "nop");
+
+        // R4/F4 aliases encode as
+        // four separate 16-bit loads/stores, not two 32-bit instructions.
+        let code = [0x90, 0x14, 0x90, 0x34, 0x90, 0x14, 0x90, 0x34];
+        let lines = disassemble_visa(&code, 0, crate::disasm::decode_instruction);
+        assert_eq!(lines.len(), 4);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!((line.addr, line.raw.len()), (i as u32, 2));
+            assert_eq!(
+                line.text,
+                if i % 2 == 0 {
+                    "r4=dm (i0,m0)"
+                } else {
+                    "dm (i0,m0)=r4"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn short_data_move_mask_keeps_all_modify_bits_and_other_widths() {
+        // Vendor rows: dm(i0, M0..M7) = R4/F4. Bit 8 is M[2].
+        let stores = [
+            0x9034u16, 0x9074, 0x90b4, 0x90f4, 0x9134, 0x9174, 0x91b4, 0x91f4,
+        ];
+        for (m, word) in stores.into_iter().enumerate() {
+            let mut code = word.to_be_bytes().to_vec();
+            code.extend_from_slice(&[0, 1]);
+            assert_eq!(instruction_len(&code, 0), 2);
+            let lines = disassemble_visa(&code, 0, crate::disasm::decode_instruction);
+            assert_eq!(lines.len(), 2);
+            assert_eq!(lines[0].text, format!("dm (i0,m{m})=r4"));
+            assert_eq!(lines[1].text, "nop");
+        }
+
+        // Neighboring 0x9xxx families remain wide: vendor
+        // pm(i10,m8)=0 is 32-bit; dm(i2,m0)=0x1c0111
+        // is 48-bit. Neither has Type 3c's fixed bit 4.
+        for code in [
+            vec![0x94, 0x24, 0x00, 0x00],
+            vec![0x94, 0x00, 0x00, 0x1c, 0x01, 0x11],
+        ] {
+            let len = code.len();
+            let mut stream = code;
+            stream.extend_from_slice(&[0, 1]);
+            assert_eq!(instruction_len(&stream, 0), len);
+            let lines = disassemble_visa(&stream, 0, crate::disasm::decode_instruction);
+            assert_eq!(lines.len(), 2);
+            assert_eq!(lines[0].raw.len(), len);
+            assert_eq!(lines[1].text, "nop");
+        }
     }
 }

@@ -87,108 +87,62 @@ fn dreg(index: u32, float: bool) -> String {
     }
 }
 
-fn ureg_name(code: u32) -> String {
+/// Universal register names. One code table serves the 48-bit and the
+/// compact forms (vendor `pcstk = 0x100000` = 0f6400100000, `r0 = ustat3`
+/// = 77ff003f).
+/// The universal register name for `code` (e.g. 0x1A -> "I10").
+pub fn ureg_display_name(code: u16) -> String {
+    ureg_name(u32::from(code))
+}
+
+pub(crate) fn ureg_name(code: u32) -> String {
     let group = (code >> 4) & 0xF;
     let reg = code & 0xF;
-    match group {
-        0x0 => format!("R{reg}"),
-        0x1 => format!("I{reg}"),
-        0x2 => format!("M{reg}"),
-        0x3 => format!("L{reg}"),
-        0x4 => format!("B{reg}"),
-        0x5 => format!("S{reg}"),
-        0x6 => match reg {
-            0x0 => "FADDR".into(),
-            0x1 => "DADDR".into(),
-            0x2 => "PC".into(),
-            0x3 => "PCSTK".into(),
-            0x4 => "PCSTKP".into(),
-            0x5 => "LADDR".into(),
-            0x6 => "CURLCNTR".into(),
-            0x7 => "LCNTR".into(),
-            0x8 => "EMUCLK".into(),
-            0x9 => "EMUCLK2".into(),
-            0xC => "PX".into(),
-            0xD => "PX1".into(),
-            0xE => "PX2".into(),
-            _ => format!("UREG(0x{code:02X})"),
-        },
-        0x7 => match reg {
-            0x0 => "MODE1".into(),
-            0x1 => "MODE2".into(),
-            0x2 => "FLAGS".into(),
-            0x3 => "ASTATx".into(),
-            0x4 => "ASTATy".into(),
-            0x5 => "STKYx".into(),
-            0x6 => "STKYy".into(),
-            0x8 => "IRPTL".into(),
-            0x9 => "IMASK".into(),
-            0xA => "IMASKP".into(),
-            0xB => "LRPTL".into(),
-            0xC => "MMASK".into(),
-            _ => format!("UREG(0x{code:02X})"),
-        },
-        0x8 => match reg {
-            0x0 => "USTAT1".into(),
-            0x1 => "USTAT2".into(),
-            0x2 => "USTAT3".into(),
-            0x3 => "USTAT4".into(),
-            _ => format!("UREG(0x{code:02X})"),
-        },
-        0x9 => match reg {
-            0x0 => "TPERIOD".into(),
-            0x1 => "TCOUNT".into(),
-            _ => format!("UREG(0x{code:02X})"),
-        },
-        _ => format!("UREG(0x{code:02X})"),
-    }
+    let sys = match (group, reg) {
+        (0x0, _) => return format!("R{reg}"),
+        (0x1, _) => return format!("I{reg}"),
+        (0x2, _) => return format!("M{reg}"),
+        (0x3, _) => return format!("L{reg}"),
+        (0x4, _) => return format!("B{reg}"),
+        (0x5, _) => return format!("S{reg}"),
+        (0x6, 0x0) => "FADDR",
+        (0x6, 0x1) => "DADDR",
+        (0x6, 0x3) => "PC",
+        (0x6, 0x4) => "PCSTK",
+        (0x6, 0x5) => "PCSTKP",
+        (0x6, 0x6) => "LADDR",
+        (0x6, 0x7) => "CURLCNTR",
+        (0x6, 0x8) => "LCNTR",
+        (0x6, 0x9) => "EMUCLK",
+        (0x6, 0xA) => "EMUCLK2",
+        (0x6, 0xB) => "PX",
+        (0x6, 0xC) => "PX1",
+        (0x6, 0xD) => "PX2",
+        (0x6, 0xE) => "TPERIOD",
+        (0x6, 0xF) => "TCOUNT",
+        (0x7, 0x0) => "USTAT1",
+        (0x7, 0x1) => "USTAT2",
+        (0x7, 0x2) => "MODE1",
+        (0x7, 0x3) => "MMASK",
+        (0x7, 0x4) => "MODE2",
+        (0x7, 0x5) => "FLAGS",
+        (0x7, 0x6) => "ASTATx",
+        (0x7, 0x7) => "ASTATy",
+        (0x7, 0x8) => "STKYx",
+        (0x7, 0x9) => "STKYy",
+        (0x7, 0xA) => "IRPTL",
+        (0x7, 0xB) => "IMASK",
+        (0x7, 0xC) => "IMASKP",
+        (0x7, 0xD) => "MODE1STK",
+        (0x7, 0xE) => "USTAT3",
+        (0x7, 0xF) => "USTAT4",
+        _ => return format!("UREG(0x{code:02X})"),
+    };
+    sys.into()
 }
 
 fn visa_ureg_name(code: u32) -> String {
-    let group = (code >> 4) & 0x7;
-    let reg = code & 0xF;
-    match group {
-        0x0 => format!("R{reg}"),
-        0x1 => format!("I{reg}"),
-        0x2 => format!("M{reg}"),
-        0x3 => format!("L{reg}"),
-        0x4 => format!("B{reg}"),
-        0x5 => format!("S{reg}"),
-        0x6 => match reg {
-            0x0 => "FADDR".into(),
-            0x1 => "DADDR".into(),
-            0x3 => "PC".into(),
-            0x4 => "PCSTK".into(),
-            0x5 => "PCSTKP".into(),
-            0x6 => "LADDR".into(),
-            0x7 => "CURLCNTR".into(),
-            0x8 => "LCNTR".into(),
-            0x9 => "EMUCLK".into(),
-            0xA => "EMUCLK2".into(),
-            0xB => "PX".into(),
-            0xC => "PX1".into(),
-            0xD => "PX2".into(),
-            _ => format!("UREG(0x{code:02X})"),
-        },
-        0x7 => match reg {
-            0x0 => "MODE1".into(),
-            0x1 => "MODE2".into(),
-            0x2 => "MODE1".into(),
-            0x3 => "MODE2".into(),
-            0x4 => "MODE2".into(),
-            0x5 => "FLAGS".into(),
-            0x6 => "ASTATx".into(),
-            0x7 => "ASTATy".into(),
-            0x8 => "STKYx".into(),
-            0x9 => "STKYy".into(),
-            0xA => "IRPTL".into(),
-            0xB => "IMASK".into(),
-            0xC => "IMASKP".into(),
-            0xD => "MODE1STK".into(),
-            _ => format!("UREG(0x{code:02X})"),
-        },
-        _ => format!("UREG(0x{code:02X})"),
-    }
+    ureg_name(code & 0x7F)
 }
 
 fn cond_name(code: u32) -> &'static str {
@@ -353,6 +307,17 @@ fn decode_alu(opcode: u8, rn: u32, rx: u32, ry: u32) -> String {
         0xC5 => format!("{} = RSQRTS {}", r(rn), r(rx)),
         0xC9 => format!("{} = FIX {}", dreg(rn, false), r(rx)),
         0xCA => format!("{} = FLOAT {}", r(rn), dreg(rx, false)),
+        // ALU dual add/subtract, Rs in the opcode's low nibble (the reference assembler
+        // `f12 = f2 + f6 , f8 = f2 - f6` = 018f8c26).
+        0xF0..=0xFF => format!(
+            "{} = {} + {} , {} = {} - {}",
+            r(rn),
+            r(rx),
+            r(ry),
+            r(u32::from(opcode & 0xF)),
+            r(rx),
+            r(ry)
+        ),
         0xCD => format!("{} = TRUNC {}", dreg(rn, false), r(rx)),
         0xD9 => format!("{} = FIX {} BY {}", dreg(rn, false), r(rx), dreg(ry, false)),
         0xDA => format!(
@@ -390,28 +355,70 @@ fn decode_mul(opcode: u8, rn: u32, rx: u32, ry: u32) -> String {
     let r = |i: u32| dreg(i, false);
     let f = |i: u32| dreg(i, true);
     match opcode {
-        0x08 => format!("{} = SAT MRF", r(rn)),
-        0x0A => format!("{} = SAT MRB", r(rn)),
+        // The reference assembler SAT/RND opcodes, all MEASURED: bit 2 =
+        // MR target (rn 0), bit 1 = MRB, bit 3 = fractional, bit 0 = signed,
+        // bit 4 = RND (fractional only). There is no TRNC form.
+        0x00 => format!("{} = SAT MRF (UI)", r(rn)),
+        0x01 => format!("{} = SAT MRF (SI)", r(rn)),
+        0x02 => format!("{} = SAT MRB (UI)", r(rn)),
+        0x03 => format!("{} = SAT MRB (SI)", r(rn)),
+        0x04 => "MRF = SAT MRF (UI)".into(),
+        0x05 => "MRF = SAT MRF (SI)".into(),
+        0x06 => "MRB = SAT MRB (UI)".into(),
+        0x07 => "MRB = SAT MRB (SI)".into(),
+        0x08 => format!("{} = SAT MRF (UF)", r(rn)),
+        0x09 => format!("{} = SAT MRF (SF)", r(rn)),
+        0x0A => format!("{} = SAT MRB (UF)", r(rn)),
+        0x0B => format!("{} = SAT MRB (SF)", r(rn)),
+        0x0C => "MRF = SAT MRF (UF)".into(),
+        0x0D => "MRF = SAT MRF (SF)".into(),
+        0x0E => "MRB = SAT MRB (UF)".into(),
+        0x0F => "MRB = SAT MRB (SF)".into(),
         0x14 => "MRF = 0".into(),
         0x16 => "MRB = 0".into(),
-        0x18 => "MRF = TRNC MRF".into(),
-        0x1A => "MRB = TRNC MRB".into(),
-        0x1C => format!("{} = TRNC MRF", r(rn)),
-        0x1E => format!("{} = TRNC MRB", r(rn)),
+        0x18 => format!("{} = RND MRF (UF)", r(rn)),
+        0x19 => format!("{} = RND MRF (SF)", r(rn)),
+        0x1A => format!("{} = RND MRB (UF)", r(rn)),
+        0x1B => format!("{} = RND MRB (SF)", r(rn)),
+        0x1C => "MRF = RND MRF (UF)".into(),
+        0x1D => "MRF = RND MRF (SF)".into(),
+        0x1E => "MRB = RND MRB (UF)".into(),
+        0x1F => "MRB = RND MRB (SF)".into(),
         0x30 => format!("{} = {} * {}", f(rn), f(rx), f(ry)),
-        0x44 => format!("MRF = {} * {} (UUI)", r(rx), r(ry)),
-        0x4C => format!("MRF = {} * {} (UUF)", r(rx), r(ry)),
-        0x70 => format!("{} = {} * {} (SSI)", r(rn), r(rx), r(ry)),
-        0x74 => format!("MRF = {} * {} (SSI)", r(rx), r(ry)),
-        0x78 => format!("{} = {} * {} (SSF)", r(rn), r(rx), r(ry)),
-        0x7C => format!("MRF = {} * {} (SSF)", r(rx), r(ry)),
-        0x7E => format!("MRB = {} * {} (SSF)", r(rx), r(ry)),
-        0xB8 => format!("{} = MRF + {} * {} (SSF)", r(rn), r(rx), r(ry)),
-        0xBC => format!("MRF = MRF + {} * {} (SSF)", r(rx), r(ry)),
-        0xBE => format!("MRB = MRB + {} * {} (SSF)", r(rx), r(ry)),
-        0xFC => format!("MRF = MRF - {} * {} (SSF)", r(rx), r(ry)),
-        0xFE => format!("MRB = MRB - {} * {} (SSF)", r(rx), r(ry)),
+        0x40..=0xFF => decode_fixed_mul(opcode, rn, rx, ry),
         _ => format!("MUL opcode 0x{opcode:02X}"),
+    }
+}
+
+/// The `ddyx f??r` fixed-point multiplies (template in `encode_mul`):
+/// y/x = Ry/Rx signed, f = fractional, r = rounding.
+pub(crate) fn decode_fixed_mul(opcode: u8, rn: u32, rx: u32, ry: u32) -> String {
+    let r = |i: u32| dreg(i, false);
+    let sign = |signed: bool| if signed { 'S' } else { 'U' };
+    let frac = opcode & 0x08 != 0;
+    let round = opcode & 0x01 != 0;
+    if round && !frac {
+        return format!("MUL opcode 0x{opcode:02X}");
+    }
+    let product = format!(
+        "{} * {} ({}{}{}{})",
+        r(rx),
+        r(ry),
+        sign(opcode & 0x10 != 0),
+        sign(opcode & 0x20 != 0),
+        if frac { 'F' } else { 'I' },
+        if round { "R" } else { "" }
+    );
+    let op = if opcode >> 6 == 2 { '+' } else { '-' };
+    match (opcode >> 6, (opcode >> 1) & 3) {
+        (1, 0) => format!("{} = {product}", r(rn)),
+        (1, 2) => format!("MRF = {product}"),
+        (1, 3) => format!("MRB = {product}"),
+        (1, _) => format!("MUL opcode 0x{opcode:02X}"),
+        (_, 0) => format!("{} = MRF {op} {product}", r(rn)),
+        (_, 1) => format!("{} = MRB {op} {product}", r(rn)),
+        (_, 2) => format!("MRF = MRF {op} {product}"),
+        _ => format!("MRB = MRB {op} {product}"),
     }
 }
 
@@ -439,6 +446,8 @@ fn decode_shift(opcode: u8, rn: u32, rx: u32, ry: u32) -> String {
         0xC4 => format!("{} = BCLR {} BY {}", r(rn), r(rx), r(ry)),
         0xC8 => format!("{} = BTGL {} BY {}", r(rn), r(rx), r(ry)),
         0xCC => format!("BTST {} BY {}", r(rx), r(ry)),
+        0x70 => format!("{} = BFFWRP", r(rn)),
+        0x7C => format!("BFFWRP = {}", r(ry)),
         _ => format!("SHIFT opcode 0x{opcode:02X}"),
     }
 }
@@ -493,6 +502,26 @@ fn decode_mf_mul_alu(field: u32, mf_op: u32, fp: bool) -> String {
     let alu_dst = dreg(ra, fp);
     let alu_x = dreg(rxa + 8, fp);
     let alu_y = dreg(rya + 12, fp);
+
+    if fp {
+        // Float: the multiply is always Fm = Fxm * Fym and mf_op[2:0] picks
+        // the ALU operation (see `encode`; the reference assembler vectors).
+        let alu_part = match mf_op & 7 {
+            0 => format!("{alu_dst} = {alu_x} + {alu_y}"),
+            1 => format!("{alu_dst} = {alu_x} - {alu_y}"),
+            2 => format!(
+                "{alu_dst} = FLOAT {} BY {}",
+                dreg(rxa + 8, false),
+                dreg(rya + 12, false)
+            ),
+            4 => format!("{alu_dst} = ({alu_x} + {alu_y})/2"),
+            5 => format!("{alu_dst} = ABS {alu_x}"),
+            6 => format!("{alu_dst} = MAX ({alu_x}, {alu_y})"),
+            7 => format!("{alu_dst} = MIN ({alu_x}, {alu_y})"),
+            _ => return format!("MULTI opcode 0x{mf_op:02X} (0x{field:06X})"),
+        };
+        return format!("{mul_dst} = {mul_x} * {mul_y} , {alu_part}");
+    }
 
     // mf_op[3:2] selects MUL variant, mf_op[1:0] selects ALU variant
     let mul_sel = (mf_op >> 2) & 0x3;
@@ -692,7 +721,7 @@ fn decode_group0(word: u64) -> String {
         0b10110 => decode_type19(word),
         0b10111 => decode_type20(word),
         0b11000 => decode_type25a(word),
-        0b11010 | 0b11011 => decode_type14d(word),
+        0b11010 | 0b11011 => decode_type14b(word),
         _ if (sub >> 2) == 0b100 => decode_type14(word),
         _ => format!("??? 0x{word:012X}"),
     }
@@ -768,40 +797,55 @@ fn decode_type3(word: u64) -> String {
     // VISA 48-bit Type 3: compute + ureg<->DM/PM with DAG register modify
     // Matches 32-bit Type 3b field layout in p1:
     //   bits[44:41] = i_addr (4-bit I register index, I0-I15)
-    //   bit[40]     = 1 (fixed)
-    //   bits[39:38] = m_offset (M register = m_offset + 4)
+    //   bits[40:38] = m register (M0-M7)
     //   bits[37:33] = cond (31 = TRUE)
     //   bit[31]     = direction (0=read, 1=write)
+    //   bit[30]     = short-word flag when bits[22:20] = 011
     //   bits[29:23] = ureg code (7 bits)
-    //   bits[22:0]  = compute
+    //   bits[22:0]  = compute; bits[22:20] = 011 with no other compute
+    //                 bits marks a (SW)/(BW) access (the reference assembler vectors)
     let bit44 = bit(word, 44);
     let i_addr = if bit44 {
         bits(word, 43, 41) // 3-bit I0-I7 when bit44=1
     } else {
         bits(word, 44, 41) // 4-bit I0-I15 when bit44=0
     };
-    let m_offset = bits(word, 39, 38);
+    let m_reg = bits(word, 40, 38);
     let cond = bits(word, 37, 33);
     let d = bit(word, 31);
     let ureg_code = bits(word, 29, 23);
-    let compute = bits(word, 22, 0);
+    let mut compute = bits(word, 22, 0);
+    // Width markers in an empty compute slot: 0x30 (SW with bit 30, else
+    // BW), 0x31 the sign-extending pair (453e40310000 `r0=dm(m4,i2)
+    // (swse)`). Bit 30 next to a real compute is (LW) (593e4008a0c0).
+    let suffix = match (compute, bit(word, 30)) {
+        (0x30_0000, true) => "(SW)",
+        (0x30_0000, false) => "(BW)",
+        (0x31_0000, true) => "(SWSE)",
+        (0x31_0000, false) => "(BWSE)",
+        (_, true) => "(LW)",
+        _ => "",
+    };
+    if matches!(compute, 0x30_0000 | 0x31_0000) {
+        compute = 0;
+    }
 
-    let m_reg = m_offset + 4;
     let ur = ureg_name(ureg_code);
+    // Bit 32 is G: PM through DAG2 (`f8 = pm(i8, m8)` = 503f04130004).
+    let pm = bit(word, 32);
+    let (mem, dag) = if pm { ("PM", 8) } else { ("DM", 0) };
+    let (i_addr, m_reg) = (i_addr + dag, m_reg + dag);
 
-    // Operand order: bit44=1 (DAG1) uses (I,M), bit44=0 (DAG2) uses (M,I)
-    let xfer = if bit44 {
-        if d {
-            format!("DM (I{i_addr},M{m_reg})={ur}")
-        } else {
-            format!("{ur}=DM (I{i_addr},M{m_reg})")
-        }
+    // Operand order: bit44=1 is post-modify (I,M), bit44=0 pre-modify (M,I)
+    let address = if bit44 {
+        format!("I{i_addr},M{m_reg}")
     } else {
-        if d {
-            format!("DM (M{m_reg},I{i_addr})={ur}")
-        } else {
-            format!("{ur}=DM (M{m_reg},I{i_addr})")
-        }
+        format!("M{m_reg},I{i_addr}")
+    };
+    let xfer = match (d, suffix) {
+        (true, "") => format!("{mem} ({address})={ur}"),
+        (true, _) => format!("{mem} ({address})={ur} {suffix}"),
+        (false, _) => format!("{ur}={mem} ({address}){suffix}"),
     };
 
     let mut out = String::new();
@@ -838,14 +882,27 @@ fn decode_type4(word: u64) -> String {
         bits(word, 44, 41)
     };
     let d = bit(word, 39);
-    let g = bit(word, 38);
+    // bit 38 = update: DM(Ii,data6) post-modify (the reference assembler 62fe12000000)
+    let post_modify = bit(word, 38);
     let cond = bits(word, 37, 33);
     let data6 = bits(word, 32, 27);
     let dm_dreg = bits(word, 26, 23);
-    let compute = bits(word, 22, 0);
+    let mut compute = bits(word, 22, 0);
+    // Width markers in an empty compute slot, bits 21:16 = 11 0 S LL
+    // (687e08300000 (bw), 647e10340000 (sw), 687e11350000 (swse)).
+    let suffix = match compute {
+        0x30_0000 => " (BW)",
+        0x31_0000 => " (BWSE)",
+        0x34_0000 => " (SW)",
+        0x35_0000 => " (SWSE)",
+        _ => "",
+    };
+    if !suffix.is_empty() {
+        compute = 0;
+    }
 
     let imm = sign_extend(data6, 6);
-    let mem = if g { "PM" } else { "DM" };
+    let mem = "DM";
     let dr = dreg(dm_dreg, false);
 
     let imm_str = if imm < 0 {
@@ -853,10 +910,15 @@ fn decode_type4(word: u64) -> String {
     } else {
         format!("0x{:X}", imm)
     };
-    let xfer = if d {
-        format!("{mem} ({imm_str},I{i_addr})={dr}")
+    let address = if post_modify {
+        format!("I{i_addr},{imm_str}")
     } else {
-        format!("{dr}={mem} ({imm_str},I{i_addr})")
+        format!("{imm_str},I{i_addr}")
+    };
+    let xfer = if d {
+        format!("{mem} ({address})={dr}{suffix}")
+    } else {
+        format!("{dr}={mem} ({address}){suffix}")
     };
 
     let mut out = String::new();
@@ -963,11 +1025,12 @@ fn decode_type6a(word: u64) -> String {
     //   bits[37:33] = condition (31=TRUE)
     // Memory fields (p2):
     //   bit[31]     = direction (0=read, 1=write)
-    //   bits[30:27] = length field (len = field * 4)
+    //   bits[30:27] = length bits 5:2 (FEXT/FDEP) or the sign of a
+    //                 negative shift count
     //   bits[26:23] = dreg
     // Shift fields:
     //   bits[23:16] = shift opcode (shift_type at bits[7:4], sub_op at bits[1:0])
-    //   bits[15:8]  = shift position
+    //   bits[15:8]  = position (5:0) and length bits 1:0 (7:6)
     //   bits[7:4]   = Rn (shift destination)
     //   bits[3:0]   = Rx (shift source)
     let i_field = bits(word, 44, 41);
@@ -976,12 +1039,26 @@ fn decode_type6a(word: u64) -> String {
     let d = bit(word, 31);
     let len_field = bits(word, 30, 27);
     let dreg_val = bits(word, 26, 23);
-    let shift_op = bits(word, 22, 16) as u8;
-    let shift_imm = bits(word, 15, 8) as u8;
+    let shift_op = bits(word, 23, 16) as u8;
+    let shift_pos = bits(word, 15, 8);
     let rn = bits(word, 7, 4);
     let rx = bits(word, 3, 0);
 
-    let shift_str = imm_shift_text(shift_op, shift_imm, len_field, rn, rx);
+    // Same field split as Type 6b and the ImmShiftMem encoder.
+    let pos = shift_pos & 0x3F;
+    let len = (len_field << 2) | (shift_pos >> 6);
+
+    // Bit 23 is shared with dreg; the shift opcode is bits 22:16, the same
+    // values as Type 6b.
+    let shift_str = match shift_op & 0x7F {
+        0x10 => format!("R{rn}=FEXT R{rx} BY 0x{pos:X}:0x{len:X}"),
+        0x11 => format!("R{rn}=FDEP R{rx} BY 0x{pos:X}:0x{len:X}"),
+        0x12 => format!("R{rn}=FEXT R{rx} BY 0x{pos:X}:0x{len:X} (SE)"),
+        0x13 => format!("R{rn}=FDEP R{rx} BY 0x{pos:X}:0x{len:X} (SE)"),
+        0x19 => format!("R{rn}=R{rn} OR FDEP R{rx} BY 0x{pos:X}:0x{len:X}"),
+        0x1B => format!("R{rn}=R{rn} OR FDEP R{rx} BY 0x{pos:X}:0x{len:X} (SE)"),
+        _ => format!("R{rn}=SHIFT(0x{shift_op:02X}) R{rx} BY 0x{shift_pos:X}:0x{len_field:X}"),
+    };
 
     let mem = "DM";
     let mem_str = if d {
@@ -1007,55 +1084,74 @@ fn decode_type6b(word: u64) -> String {
     let rn = bits(word, 7, 4);
     let rx = bits(word, 3, 0);
     let imm8 = bits(word, 15, 8) as u8;
-    let op = bits(word, 23, 16) as u8;
-    let len_hi = bits(word, 31, 27);
-    imm_shift_text(op, imm8, len_hi, rn, rx)
-}
+    let op_field = bits(word, 23, 16);
+    let shift_type = (op_field >> 4) & 0xF;
+    let sub_op = op_field & 3;
 
-/// Text of an immediate shift by its PRM Table 17-9 shiftimm opcode (`op`, 7 bits).
-fn imm_shift_text(op: u8, imm8: u8, len_hi: u32, rn: u32, rx: u32) -> String {
-    let signed = |name: &str, or: bool| {
-        let imm = imm8 as i8;
-        let or = if or {
-            format!("R{rn} OR ")
-        } else {
-            String::new()
-        };
-        if imm < 0 {
-            format!("R{rn}={or}{name} R{rx} BY -0x{:X}", -(imm as i32))
-        } else {
-            format!("R{rn}={or}{name} R{rx} BY 0x{imm:X}")
+    match shift_type {
+        0 => {
+            // LSHIFT/ASHIFT by immediate; SHIFTOP = register opcode >> 2
+            // (the reference assembler: LSHIFT 0x00, ASHIFT 0x01, OR LSHIFT 0x08). The
+            // count is imm8; DATAEX bits[30:27] only sign-extend it.
+            let name = match op_field {
+                0x00 => "LSHIFT",
+                0x01 => "ASHIFT",
+                0x02 => "ROT",
+                0x08 => "OR LSHIFT",
+                0x09 => "OR ASHIFT",
+                _ => return format!("R{rn}=SHIFT(0x{op_field:02X}) R{rx} BY 0x{imm8:X}"),
+            };
+            let lhs = if op_field & 0x08 != 0 {
+                format!("R{rn}=R{rn} ")
+            } else {
+                format!("R{rn}=")
+            };
+            let imm = imm8 as i8;
+            if imm < 0 {
+                format!("{lhs}{name} R{rx} BY -0x{:X}", -(imm as i32))
+            } else {
+                format!("{lhs}{name} R{rx} BY 0x{imm:X}")
+            }
         }
-    };
-    // Position is in imm8[5:0]; length is len_hi (high bits) and imm8[7:6] (low 2 bits).
-    let field = |name: &str, or: bool, se: bool| {
-        let pos = imm8 & 0x3F;
-        let len = (len_hi << 2) | ((imm8 >> 6) & 3) as u32;
-        let or = if or {
-            format!("R{rn} OR ")
-        } else {
-            String::new()
-        };
-        let se = if se { " (SE)" } else { "" };
-        format!("R{rn}={or}{name} R{rx} BY 0x{pos:X}:0x{len:X}{se}")
-    };
-    match op {
-        0x00 => signed("LSHIFT", false),
-        0x01 => signed("ASHIFT", false),
-        0x02 => format!("R{rn}=ROT R{rx} BY 0x{imm8:X}"),
-        0x08 => signed("LSHIFT", true),
-        0x09 => signed("ASHIFT", true),
-        0x10 => field("FEXT", false, false),
-        0x11 => field("FDEP", false, false),
-        0x12 => field("FEXT", false, true),
-        0x13 => field("FDEP", false, true),
-        0x1B => field("FDEP", true, false),
-        0x1D => field("FDEP", true, true),
-        0x30 => format!("R{rn}=BSET R{rx} BY 0x{imm8:X}"),
-        0x31 => format!("R{rn}=BCLR R{rx} BY 0x{imm8:X}"),
-        0x32 => format!("R{rn}=BTGL R{rx} BY 0x{imm8:X}"),
-        0x33 => format!("BTST R{rx} BY 0x{imm8:X}"),
-        _ => format!("R{rn}=SHIFT(0x{op:02X}) R{rx} BY 0x{imm8:X}"),
+        1 => {
+            // FEXT/FDEP with immediate bit position
+            // Position is in bits[13:8] (low 6 bits of imm8)
+            // Length is split across bits[31:27] (high 5) and bits[15:14] (low 2)
+            let pos = imm8 & 0x3F;
+            let len_hi = bits(word, 31, 27);
+            let len_lo = (imm8 >> 6) & 3;
+            let len = (len_hi << 2) | (len_lo as u32);
+            // The opcode is the register opcode >> 2 (see
+            // `type6_shift_op`): 0x10 FEXT, 0x11 FDEP, 0x12 FEXT (SE),
+            // 0x13 FDEP (SE), 0x19 OR FDEP (the reference assembler `r0 = r0 or fdep r12
+            // by 0x10:0x1` = 023e0019500c), 0x1b OR FDEP (SE). The bit
+            // FIFO ops carry a 12-bit immediate (bits 11:8 at 30:27):
+            // 0x14 BITEXT, 0x1d BITDEP, 0x1f BFFWRP = imm7.
+            let imm12 = (bits(word, 30, 27) << 8) | u32::from(imm8);
+            match op_field {
+                0x10 => format!("R{rn}=FEXT R{rx} BY 0x{pos:X}:0x{len:X}"),
+                0x11 => format!("R{rn}=FDEP R{rx} BY 0x{pos:X}:0x{len:X}"),
+                0x12 => format!("R{rn}=FEXT R{rx} BY 0x{pos:X}:0x{len:X} (SE)"),
+                0x13 => format!("R{rn}=FDEP R{rx} BY 0x{pos:X}:0x{len:X} (SE)"),
+                0x19 => format!("R{rn}=R{rn} OR FDEP R{rx} BY 0x{pos:X}:0x{len:X}"),
+                0x1B => format!("R{rn}=R{rn} OR FDEP R{rx} BY 0x{pos:X}:0x{len:X} (SE)"),
+                0x14 => format!("R{rn}=BITEXT 0x{imm12:X}"),
+                0x1D => format!("BITDEP R{rx} BY 0x{imm12:X}"),
+                0x1F => format!("BFFWRP=0x{imm8:X}"),
+                _ => format!("R{rn}=SHIFT(0x{op_field:02X}) R{rx} BY 0x{imm8:X}"),
+            }
+        }
+        3 => {
+            // BIT ops: BSET/BCLR/BTGL/BTST
+            match sub_op {
+                0 => format!("R{rn}=BSET R{rx} BY 0x{imm8:X}"),
+                1 => format!("R{rn}=BCLR R{rx} BY 0x{imm8:X}"),
+                2 => format!("R{rn}=BTGL R{rx} BY 0x{imm8:X}"),
+                3 => format!("BTST R{rx} BY 0x{imm8:X}"),
+                _ => unreachable!(),
+            }
+        }
+        _ => format!("R{rn}=SHIFT(0x{op_field:02X}) R{rx} BY 0x{imm8:X}"),
     }
 }
 
@@ -1081,7 +1177,15 @@ fn decode_type7(word: u64) -> String {
         let dst = i_dest + base;
         let m = m_field + base;
 
-        let modify = format!("I{dst}=MODIFY (I{src},M{m})(NW)");
+        // Bits 39 and 23 together: B2W/W2B, M field = op (`i3 = b2w ( i7 )`
+        // = 04bfc4800000, `b3 = w2b ( b7 )` = 04bfdc800000).
+        let modify = if bit(word, 23) && m_field < 4 {
+            let reg = if m_field < 2 { 'I' } else { 'B' };
+            let op = if m_field & 1 == 0 { "B2W" } else { "W2B" };
+            format!("{reg}{dst}={op} ({reg}{src})")
+        } else {
+            format!("I{dst}=MODIFY (I{src},M{m})(NW)")
+        };
         let mut out = String::new();
         if cond != 31 {
             write!(out, "IF {} ", cond_name(cond)).unwrap();
@@ -1094,27 +1198,26 @@ fn decode_type7(word: u64) -> String {
         }
         out
     } else {
-        // Standard Type 7: bit39=0
-        // bit38 = g, bits[37:35] = i_field, bits[34:32] = m_field
-        // bits[27:23] = cond (5 bits at different position than enhanced)
+        // Type 7 without (NW): same field layout as above (the reference assembler
+        // `i0 = modify(i1,m4)` = 043e61000000,
+        // `f8 = f10*f7, i0 = modify(i1,m4)` = 043e611308a7).
         let g = bit(word, 38);
-        let i_field = bits(word, 37, 35);
-        let m_field = bits(word, 34, 32);
-        let cond = bits(word, 27, 23);
+        let cond = bits(word, 37, 33);
+        let i_src = bits(word, 32, 30);
+        let m_field = bits(word, 29, 27);
+        let dest_xor = bits(word, 26, 24);
         let compute = bits(word, 22, 0);
+        let base = if g { 8u32 } else { 0 };
+        let src = i_src + base;
+        let m = m_field + base;
 
-        let i_reg = if g {
-            format!("I{}", (i_field & 7) + 8)
+        // `(SW)` = bit 23 (`i0 = modify ( i4 , m4 ) ( sw )` = 043f24800000).
+        let sw = if bit(word, 23) { "(SW)" } else { "" };
+        let modify = if dest_xor == 0 {
+            format!("MODIFY(I{src}, M{m}){sw}")
         } else {
-            format!("I{}", i_field & 7)
+            format!("I{}=MODIFY (I{src},M{m}){sw}", (i_src ^ dest_xor) + base)
         };
-        let m_reg = if g {
-            format!("M{}", (m_field & 7) + 8)
-        } else {
-            format!("M{}", m_field & 7)
-        };
-
-        let modify = format!("MODIFY({i_reg}, {m_reg})");
 
         let mut out = String::new();
         if cond != 31 {
@@ -1145,11 +1248,22 @@ fn decode_type8a(word: u64) -> String {
     if cond != 31 {
         write!(out, "IF {} ", cond_name(cond)).unwrap();
     }
-    let _ = write!(out, "{op} 0x{addr24:06X}");
+    let _ = write!(out, "{op} {}", signed24(addr24));
     if db {
         out.push_str(" (DB)");
     }
     out
+}
+
+/// An absolute branch field as the reference assembler writes it: a signed 24-bit value
+/// (`if eq jump -0x436fa5` = 060000bc905b). An unsigned spelling above
+/// 0x7fffff is not valid assembler input.
+fn signed24(addr24: u32) -> String {
+    if addr24 & 0x80_0000 != 0 {
+        format!("-0x{:06X}", 0x100_0000 - addr24)
+    } else {
+        format!("0x{addr24:06X}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,11 +1302,14 @@ fn decode_type8b(word: u64) -> String {
 // ---------------------------------------------------------------------------
 
 fn decode_type9a(word: u64) -> String {
+    // The reference assembler layout: CALL 39, cond 37:33, I 32:30, M 29:27, (DB) 26,
+    // ELSE 25, compute 22:0 (see `encode_type9a`).
     let j = bit(word, 39); // 0=JUMP, 1=CALL
     let cond = bits(word, 37, 33);
-    let db = bit(word, 32);
+    let pmi = bits(word, 32, 30);
     let pmm = bits(word, 29, 27);
-    let pmi = bits(word, 26, 24);
+    let db = bit(word, 26);
+    let else_flag = bit(word, 25);
     let compute = bits(word, 22, 0);
 
     let op = if j { "CALL" } else { "JUMP" };
@@ -1204,7 +1321,14 @@ fn decode_type9a(word: u64) -> String {
     if db {
         out.push_str(" (DB)");
     }
-    append_compute(&mut out, compute);
+    if else_flag {
+        let comp = decode_compute(compute);
+        if !comp.is_empty() {
+            let _ = write!(out, " , ELSE {comp}");
+        }
+    } else {
+        append_compute(&mut out, compute);
+    }
     out
 }
 
@@ -1350,10 +1474,10 @@ fn decode_type10b(word: u64) -> String {
 // ---------------------------------------------------------------------------
 
 fn decode_type11a(word: u64) -> String {
-    let x = bit(word, 39); // 0=RTS, 1=RTI
+    let x = bit(word, 40); // opcode 0x0A = RTS, 0x0B = RTI
     let cond = bits(word, 37, 33);
     let db = bit(word, 26);
-    let lr = bit(word, 25);
+    let lr = bit(word, 24); // the reference assembler `if ne rts (lr)` = 0a2001000000
     let compute = bits(word, 22, 0);
 
     let op = if x { "RTI" } else { "RTS" };
@@ -1377,7 +1501,7 @@ fn decode_type11a(word: u64) -> String {
 // ---------------------------------------------------------------------------
 
 fn decode_type11b(word: u64) -> String {
-    let x = bit(word, 39);
+    let x = bit(word, 40);
     let cond = bits(word, 37, 33);
     let db = bit(word, 26);
     let lr = bit(word, 25);
@@ -1405,8 +1529,9 @@ fn decode_type11b(word: u64) -> String {
 
 fn decode_type12a(word: u64) -> String {
     let imm16 = bits(word, 39, 24);
-    let addr24 = bits(word, 23, 0);
-    format!("LCNTR = 0x{imm16:X} , DO (PC,0x{addr24:X})UNTIL LCE")
+    let addr = bits(word, 22, 0);
+    let f = if bit(word, 23) { " (F)" } else { "" };
+    format!("LCNTR = 0x{imm16:X} , DO (PC,0x{addr:X})UNTIL LCE{f}")
 }
 
 // ---------------------------------------------------------------------------
@@ -1415,9 +1540,10 @@ fn decode_type12a(word: u64) -> String {
 
 fn decode_type12b(word: u64) -> String {
     let ureg_field = bits(word, 39, 32);
-    let addr24 = bits(word, 23, 0);
+    let addr = bits(word, 22, 0);
+    let f = if bit(word, 23) { " (F)" } else { "" };
     format!(
-        "LCNTR = {}, DO 0x{addr24:06X} UNTIL LCE",
+        "LCNTR = {}, DO 0x{addr:06X} UNTIL LCE{f}",
         ureg_name(ureg_field)
     )
 }
@@ -1428,8 +1554,9 @@ fn decode_type12b(word: u64) -> String {
 
 fn decode_type13(word: u64) -> String {
     let term = bits(word, 37, 33);
-    let addr24 = bits(word, 23, 0);
-    format!("DO 0x{addr24:06X} UNTIL {}", term_name(term))
+    let addr = bits(word, 22, 0);
+    let f = if bit(word, 23) { " (F)" } else { "" };
+    format!("DO 0x{addr:06X} UNTIL {}{f}", term_name(term))
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,16 +1566,18 @@ fn decode_type13(word: u64) -> String {
 fn decode_type14(word: u64) -> String {
     let g = bit(word, 41); // 0=DM, 1=PM
     let d = bit(word, 40); // 0=read, 1=write
-    let ureg_field = bits(word, 39, 32);
+                           // Bit 39 is (LW) (the reference assembler `r0 = dm(0x1)(lw)` = 108000000001).
+    let lw = if bit(word, 39) { " (LW)" } else { "" };
+    let ureg_field = bits(word, 38, 32);
     let addr32 = bits(word, 31, 0);
 
     let mem = if g { "PM" } else { "DM" };
     let ur = ureg_name(ureg_field);
 
     if d {
-        format!("{mem} (0x{addr32:X})={ur}")
+        format!("{mem} (0x{addr32:X})={ur}{lw}")
     } else {
-        format!("{ur}={mem} (0x{addr32:X})")
+        format!("{ur}={mem} (0x{addr32:X}){lw}")
     }
 }
 
@@ -1533,15 +1662,16 @@ fn decode_type17(word: u64) -> String {
 // ---------------------------------------------------------------------------
 
 fn decode_type18(word: u64) -> String {
-    // op = (bit39 << 1) | bit37, sreg from remaining bits
-    let op = ((bits(word, 39, 39) << 1) | bits(word, 37, 37)) as u8;
+    // BOP = bits 39:37, sreg = bits 36:32.
+    let op = bits(word, 39, 37) as u8;
     let sr5 = bits(word, 36, 32) as u8;
 
     let opname = match op {
         0 => "BIT SET",
         1 => "BIT CLR",
-        2 => "BIT TST",
-        3 => "BIT XOR",
+        2 => "BIT TGL",
+        4 => "BIT TST",
+        5 => "BIT XOR",
         _ => "BIT ???",
     };
 
@@ -1561,6 +1691,10 @@ fn decode_type18(word: u64) -> String {
         0x0B => "IMASK",
         0x0C => "IMASKP",
         0x0D => "MODE1STK",
+        0x00 => "USTAT1",
+        0x01 => "USTAT2",
+        0x0E => "USTAT3",
+        0x0F => "USTAT4",
         _ => "SREG(?)",
     };
 
@@ -1578,8 +1712,10 @@ fn decode_type18(word: u64) -> String {
 // ---------------------------------------------------------------------------
 
 fn decode_type19(word: u64) -> String {
-    let g = bit(word, 39);
-    let brev = bit(word, 38);
+    // bit 39 = BITREV, bit 38 = DAG select (the reference assembler 168000000010,
+    // 164200000004).
+    let brev = bit(word, 39);
+    let g = bit(word, 38);
     let i_src = bits(word, 34, 32);
     let i_dest_off = bits(word, 37, 35);
     let data32 = bits(word, 31, 0);
@@ -1590,7 +1726,7 @@ fn decode_type19(word: u64) -> String {
     let signed_data = data32 as i32;
 
     let data_str = if signed_data < 0 {
-        format!("-0x{:X}", -signed_data)
+        format!("-0x{:X}", -i64::from(signed_data))
     } else {
         format!("0x{signed_data:X}")
     };
@@ -1665,7 +1801,11 @@ fn decode_type20(word: u64) -> String {
 fn decode_type25a(word: u64) -> String {
     let db = bit(word, 34);
     let addr24 = bits(word, 23, 0);
-    let mut out = format!("CJUMP 0x{addr24:06X}");
+    let mut out = if bit(word, 38) {
+        format!("CJUMP (PC,{})", signed24(addr24))
+    } else {
+        format!("CJUMP {}", signed24(addr24))
+    };
     if db {
         out.push_str(" (DB)");
     }
@@ -1698,7 +1838,7 @@ fn decode_type19_nw(word: u64) -> String {
     let suffix = if nw { "(NW)" } else { "(SW)" };
 
     let data_str = if signed_data < 0 {
-        format!("-0x{:X}", -signed_data)
+        format!("-0x{:X}", -i64::from(signed_data))
     } else {
         format!("0x{signed_data:X}")
     };
@@ -1707,38 +1847,30 @@ fn decode_type19_nw(word: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Type 14d: Dreg<->DM, absolute address, byte or short word or exclusive (PRM Figure 16-2)
+// Type 14d: DM/PM with byte-width access (sub=11011)
 // ---------------------------------------------------------------------------
 
-fn decode_type14d(word: u64) -> String {
+fn decode_type14b(word: u64) -> String {
+    // Type 14b (opcode 0x1a read / 0x1b write): DM data-register access at
+    // an absolute address with a width: bit 38 short (else byte), bit 36
+    // sign extension, bits 35:32 the register. The reference assembler `r0 =
+    // dm(0x252718)(bw)` = 1a0000252718, `dm(0x1) = r4(sw)` = 1b4400000001,
+    // `r11 = dm(0x1)(swse)` = 1a5b00000001. (Selache had a guessed "14d".)
     let d = bit(word, 40);
-    let ex = bit(word, 39);
-    let l = bit(word, 38);
-    let w = bit(word, 37);
-    let x = bit(word, 36);
-    let dreg = bits(word, 35, 32);
+    let short = bit(word, 38);
+    let se = bit(word, 36);
+    let r = bits(word, 35, 32);
     let addr32 = bits(word, 31, 0);
-
-    // PRM opcode table: w=0 is BH/BHSE (byte or short word by l, sign extension by x on loads), w=1 is a normal or long word
-    // (EX / LWEX).
-    let size = match (w, l) {
-        (false, false) => "BW",
-        (false, true) => "SW",
-        (true, false) => "",
-        (true, true) => "LW",
-    };
-    let se = if !d && !w && x { "SE" } else { "" };
-    let ex = if ex { "EX" } else { "" };
-    let suffix = match (size.is_empty(), ex.is_empty()) {
-        (true, true) => String::new(),
-        (true, false) => format!(" ({ex})"),
-        (false, true) => format!(" ({size}{se})"),
-        (false, false) => format!(" ({size}{se}, {ex})"),
+    let width = match (short, se) {
+        (true, true) => "(SWSE)",
+        (true, false) => "(SW)",
+        (false, true) => "(BWSE)",
+        (false, false) => "(BW)",
     };
     if d {
-        format!("DM (0x{addr32:X})=R{dreg}{suffix}")
+        format!("DM (0x{addr32:X})=R{r} {width}")
     } else {
-        format!("R{dreg}=DM (0x{addr32:X}){suffix}")
+        format!("R{r}=DM (0x{addr32:X}) {width}")
     }
 }
 
@@ -1945,8 +2077,9 @@ mod tests {
 
     #[test]
     fn test_rti() {
-        // Type 11a: 000_01010, J=1 (RTI), COND=31
-        let word: u64 = (0x0Au64 << 40) | (1u64 << 39) | (31u64 << 33);
+        // RTI is opcode 0x0B (the reference assembler 16-bit `rti` = 0bbe; see
+        // encode_type11a), COND=31
+        let word: u64 = (0x0Bu64 << 40) | (31u64 << 33);
         assert_eq!(dis(word), "RTI");
     }
 
@@ -1988,6 +2121,26 @@ mod tests {
     }
 
     #[test]
+    fn type13_fast_flag_is_not_part_of_the_target() {
+        // Reference assembler vectors: F changes bit 23, not the target
+        // offset. Automatic F is set for target 0x1e and cleared with
+        // `-no-auto-fast-loops`.
+        for (word, expected) in [
+            (0x0e1e00004000, "DO 0x004000 UNTIL LCE"),
+            (0x0e1e00000001, "DO 0x000001 UNTIL LCE"),
+            (0x0e1e00800001, "DO 0x000001 UNTIL LCE (F)"),
+            (0x0e0000000001, "DO 0x000001 UNTIL EQ"),
+            (0x0e1e00800080, "DO 0x000080 UNTIL LCE (F)"),
+            (0x0e1e00800000, "DO 0x000000 UNTIL LCE (F)"),
+            (0x0e1e00800101, "DO 0x000101 UNTIL LCE (F)"),
+            (0x0e1e0080001e, "DO 0x00001E UNTIL LCE (F)"),
+            (0x0e1e0000001e, "DO 0x00001E UNTIL LCE"),
+        ] {
+            assert_eq!(dis(word), expected, "{word:012x}");
+        }
+    }
+
+    #[test]
     fn test_imm_load_type17() {
         // Type 17: 000_01111
         // R0 = 0x12345678, ureg=0x00 (R0), imm32=0x12345678
@@ -2004,8 +2157,8 @@ mod tests {
 
     #[test]
     fn test_imm_load_mode1() {
-        // MODE1 = 0x00001000
-        let word: u64 = (0x0Fu64 << 40) | (0x70u64 << 32) | 0x00001000;
+        // MODE1 = 0x00001000 (MODE1 is universal register 0x72)
+        let word: u64 = (0x0Fu64 << 40) | (0x72u64 << 32) | 0x00001000;
         assert_eq!(dis(word), "MODE1 = 0x1000");
     }
 
@@ -2047,9 +2200,10 @@ mod tests {
 
     #[test]
     fn test_indirect_call_type9a() {
-        // CALL (M9, I10) — pmm=1(M9) at bits[29:27], pmi=2(I10) at bits[26:24]
+        // CALL (M9, I10) — pmm=1(M9) at bits[29:27], pmi=2(I10) at bits[32:30]
+        // (the reference assembler layout: `jump (m12, i12), r4 = r1 + r2` = 083f20001412)
         let word: u64 =
-            (0x08u64 << 40) | (1u64 << 39) | (31u64 << 33) | (1u64 << 27) | (2u64 << 24);
+            (0x08u64 << 40) | (1u64 << 39) | (31u64 << 33) | (1u64 << 27) | (2u64 << 30);
         assert_eq!(dis(word), "CALL (M9,I10)");
     }
 
@@ -2167,12 +2321,13 @@ mod tests {
         assert_eq!(ureg_name(0x20), "M0");
         assert_eq!(ureg_name(0x30), "L0");
         assert_eq!(ureg_name(0x40), "B0");
-        assert_eq!(ureg_name(0x62), "PC");
-        assert_eq!(ureg_name(0x67), "LCNTR");
-        assert_eq!(ureg_name(0x70), "MODE1");
-        assert_eq!(ureg_name(0x79), "IMASK");
-        assert_eq!(ureg_name(0x80), "USTAT1");
-        assert_eq!(ureg_name(0x90), "TPERIOD");
+        assert_eq!(ureg_name(0x63), "PC");
+        assert_eq!(ureg_name(0x68), "LCNTR");
+        assert_eq!(ureg_name(0x6E), "TPERIOD");
+        assert_eq!(ureg_name(0x70), "USTAT1");
+        assert_eq!(ureg_name(0x72), "MODE1");
+        assert_eq!(ureg_name(0x7B), "IMASK");
+        assert_eq!(ureg_name(0x7F), "USTAT4");
     }
 
     #[test]
@@ -2185,11 +2340,11 @@ mod tests {
 
     #[test]
     fn test_type7_compute_modify() {
-        // Type 7 (standard, bit39=0): bits[38]=g, bits[37:35]=i, bits[34:32]=m, bits[27:23]=cond
-        // G=0 (DAG1), I=0 (I0), M=1 (M1), COND=31(TRUE)
-        // compute: R0 = R1 + R2
-        let word: u64 = 0x04010f801012; // pre-computed from layout
-        assert_eq!(dis(word), "R0 = R1 + R2 , MODIFY(I0, M1)");
+        // The reference assembler: cond at [37:33],
+        // I at [32:30], M at [29:27], dest XOR I at [26:24].
+        assert_eq!(dis(0x043e61000000), "I0=MODIFY (I1,M4)");
+        assert!(dis(0x043e611308a7).ends_with(" , I0=MODIFY (I1,M4)"));
+        assert_eq!(dis(0x043e60000000), "MODIFY(I1, M4)");
     }
 
     #[test]

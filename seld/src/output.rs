@@ -431,16 +431,15 @@ fn collect_output_sections(placed: &[PlacedSection]) -> Vec<MergedSection> {
         } else {
             // SW-qualified sections hold short-word code: the SHARC+
             // assembler's VISA output, a mix of 16/32/48-bit
-            // instructions placed in a byte-wide RAM block. They are
-            // code and need SHF_EXECINSTR so dis-assemblers and
-            // loaders recognise them, but the backing memory is still
-            // writable RAM so they keep SHF_WRITE as well.
+            // instructions placed in a byte-wide RAM block. Like PM
+            // code, their ELF flags are ALLOC|EXEC, irrespective of the
+            // backing RAM: the vendor image has flags 6 and
+            // segment flags R|X for such a section.
             let is_exec = matches!(ps.qualifier, SectionQualifier::Pm | SectionQualifier::Sw);
             let is_write = matches!(
                 ps.qualifier,
                 SectionQualifier::Dm
                     | SectionQualifier::Bw
-                    | SectionQualifier::Sw
                     | SectionQualifier::ZeroInit
                     | SectionQualifier::NoInit
                     | SectionQualifier::Data64
@@ -555,6 +554,47 @@ mod tests {
         assert_eq!(merged[0].address, 0x1000);
         assert_eq!(merged[0].data, vec![0xAA, 0xBB, 0xCC, 0xDD]);
         assert!(merged[0].is_executable);
+    }
+
+    #[test]
+    fn sw_code_flags_match_vendor_image() {
+        // The reference declares
+        // /SW/DOUBLE32 seg_mod_code; the vendor image has SHF_ALLOC|SHF_EXECINSTR
+        // (6), PT_LOAD flags PF_R|PF_X (5), and PM address 0x16f3c0.
+        let layout = Layout {
+            placed: vec![PlacedSection {
+                output_name: "seg_mod_code".into(),
+                object_idx: 0,
+                input_section_idx: 1,
+                address: 0x2de780,
+                size: 2,
+                data: vec![0, 1],
+                is_nobits: false,
+                qualifier: SectionQualifier::Sw,
+                target_memory: "mem".into(),
+            }],
+            entry_address: None,
+            memory_regions: HashMap::new(),
+            reserves: HashMap::new(),
+        };
+        let symbols = SymbolTable {
+            symbols: HashMap::new(),
+            undefined: Vec::new(),
+        };
+        let bytes = generate(&layout, &[], &symbols, &OutputConfig { strip_all: true }).unwrap();
+        let header = selelf::elf::parse_header(&bytes).unwrap();
+        let section = selelf::elf::parse_section_header(
+            &bytes[header.e_shoff as usize + header.e_shentsize as usize..],
+            header.ei_data,
+        );
+        assert_eq!(section.sh_flags, SHF_ALLOC | SHF_EXECINSTR);
+        assert_eq!(section.sh_addr, 0x16f3c0);
+        let flags = u32::from_le_bytes(
+            bytes[header.e_phoff as usize + 24..header.e_phoff as usize + 28]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(flags, PF_R | PF_X);
     }
 
     #[test]

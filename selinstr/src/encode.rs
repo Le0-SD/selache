@@ -63,6 +63,9 @@ pub enum AluOp {
 /// Floating-point ALU operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaluOp {
+    /// Fn = Fx + Fy , Fs = Fx - Fy (ALU dual add/subtract, opcode 0xF0|s;
+    /// The reference assembler `f12 = f2 + f6 , f8 = f2 - f6` = 018f8c26)
+    DualAddSub { rn: u16, rs: u16, rx: u16, ry: u16 },
     /// Fn = Fx + Fy
     Add { rn: u16, rx: u16, ry: u16 },
     /// Fn = Fx - Fy
@@ -143,6 +146,10 @@ pub enum MulOp {
     SatMrf { rn: u16 },
     /// Rn = SAT MRB
     SatMrb { rn: u16 },
+    /// `Rn = SAT MRF|MRB (UI|SI|UF|SF)` / `Rn = RND MRF|MRB (UF|SF)`, vendor
+    /// opcode: SAT 0x00/0x02 (UI), 0x01/0x03 (SI), 0x08/0x0A
+    /// (UF), 0x09/0x0B (SF); RND 0x18/0x1A (UF), 0x19/0x1B (SF).
+    MrToReg { opcode: u8, rn: u16 },
     /// MRF = 0
     ClrMrf,
     /// MRB = 0
@@ -159,6 +166,15 @@ pub enum MulOp {
     MrfMulUuf { rx: u16, ry: u16 },
     /// MRF = Rx * Ry (UUI, unsigned integer)
     MrfMulUui { rx: u16, ry: u16 },
+    /// Any other fixed-point multiply of the `ddyx f??r` template in
+    /// `encode_mul`, e.g. `Rn = Rx * Ry (UUF)` (opcode 0x48). `rn` is 0
+    /// for an MRF/MRB destination.
+    FixedMul {
+        opcode: u8,
+        rn: u16,
+        rx: u16,
+        ry: u16,
+    },
     /// Fn = Fx * Fy (floating-point multiply)
     FMul { rn: u16, rx: u16, ry: u16 },
     /// Rn = MR0F (read MR register field)
@@ -226,6 +242,12 @@ pub enum ShiftOp {
     Lefto { rn: u16, rx: u16 },
     /// Rn = FPACK Fx
     Fpack { rn: u16, rx: u16 },
+    /// Rn = BFFWRP (bit FIFO write pointer), shifter opcode 0x70:
+    /// The reference assembler `r1 = bffwrp` = 01a70100.
+    BffwrpRead { rn: u16 },
+    /// BFFWRP = Ry, shifter opcode 0x7C, register in the Ry field:
+    /// The reference assembler `bffwrp = r1` = 01a7c001.
+    BffwrpWrite { ry: u16 },
     /// Fn = FUNPACK Rx
     Funpack { rn: u16, rx: u16 },
 }
@@ -235,7 +257,9 @@ pub enum ShiftOp {
 pub enum MultiOp {
     /// MUL/ALU 32-bit fixed or 32/40-bit float.
     /// mul_sel: 0=Rm=Rxm*Rym, 1=MRF+=Rxm*Rym, 2=Rm=MRF+Rxm*Rym, 3=MRF-=Rxm*Rym
-    /// alu_sel: 0=Ra=Rxa+Rya, 1=Ra=Rxa-Rya, 2=Ra=(Rxa+Rya)/2
+    /// alu_sel: 0=Ra=Rxa+Rya, 1=Ra=Rxa-Rya, 2=Ra=(Rxa+Rya)/2, and for
+    /// float only 3=Fa=FLOAT Rxa BY Rya, 4=Fa=ABS Fxa, 5=Fa=MAX(Fxa,Fya),
+    /// 6=Fa=MIN(Fxa,Fya)
     MulAlu {
         fp: bool,
         mul_sel: u8,
@@ -270,6 +294,23 @@ pub enum MemWidth {
     Nw,
     /// (SW) suffix (Type 19 NW variant, sub=0x15, bit39=0)
     Sw,
+}
+
+/// Data access width of a DAG register move (Type 3 / VISA Type 3b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DagWidth {
+    /// Normal 32-bit word, no suffix.
+    Normal,
+    /// `(SW)` short-word (16-bit) access.
+    Short,
+    /// `(BW)` byte-word (8-bit) access.
+    Byte,
+    /// `(LW)` long-word access (32-bit Type 3b only).
+    Long,
+    /// `(SWSE)` sign-extended short-word load (32-bit Type 3b only).
+    ShortSe,
+    /// `(BWSE)` sign-extended byte-word load (32-bit Type 3b only).
+    ByteSe,
 }
 
 /// A compute-unit operation (23 bits when encoded).
@@ -336,8 +377,7 @@ pub enum Instruction {
     /// `JUMP (M14,I12) (DB)` return so that the old frame pointer
     /// (which the caller's delayed CALL stored on the frame stack)
     /// is popped back into I6 before control leaves the callee.
-    /// This toolchain only emits RFRAME in VISA mode: the 16-bit
-    /// compressed form is the canonical encoding (parcel 0x1901).
+    /// The 48-bit form is 0x190000000000; VISA compresses it to 0x1901.
     Rframe,
     /// Type 17: ureg = immediate32.
     LoadImm { ureg: u16, value: u32 },
@@ -358,6 +398,15 @@ pub enum Instruction {
         cond: u8,
         target: BranchTarget,
         delayed: bool,
+        loop_abort: bool,
+    },
+    /// Type 9b: PC-relative JUMP with a compute and a signed six-bit target.
+    ComputeBranch {
+        cond: u8,
+        offset: i8,
+        delayed: bool,
+        else_compute: bool,
+        compute: ComputeOp,
     },
     /// Type 4: Compute + dreg<->DM/PM with 6-bit signed immediate offset.
     ComputeLoadStore {
@@ -366,12 +415,25 @@ pub enum Instruction {
         dreg: u16,
         offset: i8,
         cond: u8,
+        /// true = DM(Ii,<data6>) post-modify (access Ii, then Ii += data6);
+        /// false = DM(<data6>,Ii) pre-modify (access Ii+data6, Ii unchanged).
+        post_modify: bool,
+        /// `(SW)` / `(BW)` access width. Only the 32-bit form has vendor
+        /// vectors (the reference assembler 683e163c `(sw)`, 683e0938 and 687e0838
+        /// `(bw)`), so the 48-bit encoder rejects anything but `Normal`.
+        width: DagWidth,
     },
     /// Type 12a: LCNTR = imm16, DO end_pc UNTIL LCE.
     /// Type 12b: LCNTR = ureg, DO end_pc UNTIL LCE.
-    DoLoop { counter: LoopCounter, end_pc: u32 },
+    DoLoop {
+        counter: LoopCounter,
+        end_pc: u32,
+        /// `(F)` suffix: the reference assembler sets bit 23 (`do _copy_end until lce (f)` =
+        /// 0c004c800000).
+        f: bool,
+    },
     /// Type 13: DO addr UNTIL cond (non-counter loop).
-    DoUntil { addr: u32, term: u8 },
+    DoUntil { addr: u32, term: u8, f: bool },
     /// Type 1: Compute + dual DM/PM transfer.
     DualMove {
         compute: Option<ComputeOp>,
@@ -384,6 +446,8 @@ pub enum Instruction {
         value: i32,
         width: MemWidth,
         bitrev: bool,
+        /// `Ia = MODIFY(Ib, data32)`: Ia XOR Ib (0 = two-operand form).
+        dest_xor: u8,
     },
     /// Type 9a: Indirect JUMP/CALL through PM register pair (Ii, Mm).
     IndirectBranch {
@@ -393,6 +457,9 @@ pub enum Instruction {
         pm_m: u8,
         delayed: bool,
         compute: Option<ComputeOp>,
+        /// `IF cond JUMP (Mm, Ii), ELSE compute`: the compute runs when
+        /// the condition is false (bit 25).
+        else_compute: bool,
     },
     /// EMUIDLE instruction (used by debugger).
     EmuIdle,
@@ -400,7 +467,7 @@ pub enum Instruction {
     Sync,
     /// Type 18: BIT SET|CLR|TGL|TST sreg data32.
     BitOp {
-        /// 0=SET, 1=CLR, 2=TST, 3=XOR
+        /// BOP field, bits 39:37: 0=SET, 1=CLR, 2=TGL, 4=TST, 5=XOR
         op: u8,
         /// System register 5-bit code
         sreg: u8,
@@ -414,7 +481,11 @@ pub enum Instruction {
         ops: u8,
     },
     /// Type 25a: CJUMP (computed jump) with optional delayed branch.
-    CJump { addr: u32, delayed: bool },
+    CJump {
+        addr: u32,
+        delayed: bool,
+        relative: bool,
+    },
     /// Type 3: Compute, ureg<->DM/PM with DAG register modify.
     UregDagMove {
         /// 0=DM/DAG1, 1=PM/DAG2
@@ -434,15 +505,39 @@ pub enum Instruction {
         /// true=DM(Ii,Mm) post-modify (addr=Ii, then Ii+=Mm)
         /// false=DM(Mm,Ii) pre-modify  (addr=Ii+Mm, Ii unchanged)
         post_modify: bool,
+        /// Data access width; `(SW)`/`(BW)` need vendor-confirmed encodings.
+        width: DagWidth,
     },
     /// Type 7: Compute + MODIFY(Ii, Mm) with DAG register.
     DagModify {
         /// 0=DAG1, 1=DAG2
         pm: bool,
+        /// `Ia = MODIFY(Ib, Mm)`: Ia XOR Ib (0 = two-operand form).
+        dest_xor: u8,
         /// I register index within DAG (0-7)
         i_reg: u8,
         /// M register index within DAG (0-7)
         m_reg: u8,
+        /// Condition code (31=TRUE)
+        cond: u8,
+        /// Optional compute
+        compute: Option<ComputeOp>,
+        /// `(NW)` = bit 39, `(SW)` = bit 23.
+        width: MemWidth,
+    },
+    /// Type 7 address conversion `Ia = B2W|W2B (Ib)` (or on B registers):
+    /// the Type 7 word with bits 39 and 23 both set and the M field
+    /// selecting the operation, 0 I B2W, 1 I W2B, 2 B B2W, 3 B W2B
+    /// (`i3 = b2w ( i7 )` = 04bfc4800000, `b3 = w2b ( b7 )` = 04bfdc800000).
+    DagConvert {
+        /// 0=DAG1, 1=DAG2
+        pm: bool,
+        /// Ia XOR Ib.
+        dest_xor: u8,
+        /// Source index within the DAG (0-7).
+        i_reg: u8,
+        /// 0-3, see above.
+        op: u8,
         /// Condition code (31=TRUE)
         cond: u8,
         /// Optional compute
@@ -493,9 +588,9 @@ pub enum Instruction {
     },
     /// Type 6b: Immediate shift (LSHIFT/ASHIFT/BSET/BCLR/BTGL/BTST/FEXT/FDEP by imm).
     ImmShift {
-        /// High nibble of the PRM Table 17-9 shiftimm opcode: 0=LSHIFT/ASHIFT/ROT and their OR forms, 1=FEXT/FDEP, 3=BSET/BCLR/BTGL/BTST
+        /// Shift type: 0=LSHIFT, 1=FEXT/FDEP, 2=ASHIFT, 3=BSET/BCLR/BTGL/BTST
         shift_type: u8,
-        /// Low nibble of the shiftimm opcode (0x8 = OR LSHIFT, 0x1 with type 1 = FDEP, ...)
+        /// Sub-operation code
         sub_op: u8,
         /// 8-bit immediate (signed for LSHIFT/ASHIFT; pos|len_lo for FEXT/FDEP)
         imm: u8,
@@ -510,9 +605,9 @@ pub enum Instruction {
     },
     /// Type 6a: Immediate shift (FEXT/FDEP) + DM memory access.
     ImmShiftMem {
-        /// High nibble of the shiftimm opcode, as in `ImmShift`
+        /// Shift type (1=FEXT/FDEP)
         shift_type: u8,
-        /// Low nibble of the shiftimm opcode, as in `ImmShift`
+        /// Sub-operation code (0=FEXT, 1=OR FDEP, 2=OR FEXT, 3=FDEP)
         sub_op: u8,
         /// 8-bit immediate (pos[5:0] | len_lo[1:0]<<6)
         imm: u8,
@@ -548,19 +643,6 @@ pub enum Instruction {
         /// 32-bit immediate value to store
         value: u32,
     },
-    /// Type 14d: data register <-> DM with absolute 32-bit address, as a byte or short word (BW, BWSE, SW, SWSE).
-    SubWordAbsAccess {
-        /// true = write (mem = dreg), false = read (dreg = mem)
-        write: bool,
-        /// true = short word (SW), false = byte (BW)
-        short: bool,
-        /// true = sign-extend the loaded value (BWSE, SWSE; loads only)
-        signed: bool,
-        /// Data register R0-R15
-        dreg: u16,
-        /// 32-bit absolute address
-        addr: u32,
-    },
     /// Type 14: ureg <-> DM/PM with absolute 32-bit address.
     UregAbsAccess {
         /// 0=DM, 1=PM
@@ -571,6 +653,9 @@ pub enum Instruction {
         ureg: u16,
         /// 32-bit absolute address
         addr: u32,
+        /// Access width: Normal, or for a DM data register (LW) (Type 14
+        /// bit 39) and (SW)/(BW)/(SWSE)/(BWSE) (Type 14b, opcode 0x1a/0x1b).
+        width: DagWidth,
     },
 }
 
@@ -604,13 +689,7 @@ pub fn encode_word(instr: &Instruction) -> Result<u64, EncodeError> {
     match *instr {
         Instruction::Nop => Ok(0),
         Instruction::Idle => Ok(1u64 << 39),
-        // RFRAME has no 48-bit ISA form in this toolchain. Return a
-        // placeholder so the encode path does not panic; the VISA
-        // compressor in `visa_encode::try_16bit` catches Rframe
-        // specifically and emits the canonical 16-bit 0x1901 parcel,
-        // so this placeholder is never written to the output of any
-        // VISA PM section.
-        Instruction::Rframe => Ok(0),
+        Instruction::Rframe => Ok(0x1900_0000_0000),
         Instruction::LoadImm { ureg, value } => encode_type17(ureg, value),
         Instruction::Return {
             interrupt,
@@ -625,18 +704,63 @@ pub fn encode_word(instr: &Instruction) -> Result<u64, EncodeError> {
             cond,
             target,
             delayed,
-        } => encode_branch(call, cond, target, delayed),
+            loop_abort,
+        } => encode_branch(call, cond, target, delayed).map(|w| w | ((loop_abort as u64) << 38)),
+        Instruction::ComputeBranch {
+            cond,
+            offset,
+            delayed,
+            else_compute,
+            compute,
+        } => {
+            // Reference vector: `if eq jump (pc,1), else f12=f0*f1` = 09000a130c01.
+            if !(-32..=31).contains(&offset) {
+                return Err(EncodeError {
+                    msg: "compute branch offset exceeds six bits".into(),
+                });
+            }
+            Ok((0x09u64 << 40)
+                | ((cond as u64 & 31) << 33)
+                | (((offset as u8 & 63) as u64) << 27)
+                | ((delayed as u64) << 26)
+                | ((else_compute as u64) << 25)
+                | encode_compute(&compute)? as u64)
+        }
         Instruction::ComputeLoadStore {
             compute,
             access,
             dreg,
             offset,
             cond,
-        } => encode_type4(compute, access, dreg, offset, cond),
-        Instruction::DoLoop { counter, end_pc } => encode_do_loop(counter, end_pc),
-        Instruction::DoUntil { addr, term } => {
+            post_modify,
+            width,
+        } => {
+            // 48-bit widths sit in the empty compute slot, bits 21:16 = 11 0 S
+            // LL (the reference assembler objects: `(bw)` 687e08300000, `(sw)` 647e10340000,
+            // `(swse)` 687e11350000 = `r2=dm(i4,2) (swse)` in a loop tail).
+            // No 48-bit (BWSE) has been seen.
+            let width_bits = match width {
+                DagWidth::Normal => 0,
+                DagWidth::Byte if compute.is_none() => 0x30u64 << 16,
+                DagWidth::Short if compute.is_none() => 0x34u64 << 16,
+                DagWidth::ShortSe if compute.is_none() && !access.write => 0x35u64 << 16,
+                _ => {
+                    return Err(EncodeError {
+                        msg: "48-bit immediate-modify (Type 4) access: this width has no \
+                              48-bit vendor vector (only (sw)/(bw)/(swse) without a compute)"
+                            .into(),
+                    })
+                }
+            };
+            Ok(encode_type4(compute, access, dreg, offset, cond, post_modify)? | width_bits)
+        }
+        Instruction::DoLoop { counter, end_pc, f } => encode_do_loop(counter, end_pc, f),
+        Instruction::DoUntil { addr, term, f } => {
             // Type 13: bits[47:40]=0x0E, bits[37:33]=term, bits[23:0]=addr24
-            let word = (0x0Eu64 << 40) | ((term as u64 & 0x1F) << 33) | (addr as u64 & 0xFFFFFF);
+            let word = (0x0Eu64 << 40)
+                | ((term as u64 & 0x1F) << 33)
+                | (addr as u64 & 0xFFFFFF)
+                | ((f as u64) << 23);
             Ok(word)
         }
         Instruction::DualMove { compute, dm, pm } => encode_type1(compute, dm, pm),
@@ -645,31 +769,39 @@ pub fn encode_word(instr: &Instruction) -> Result<u64, EncodeError> {
             value,
             width,
             bitrev,
-        } => encode_type19(i_reg, value, width, bitrev),
+            dest_xor,
+        } => encode_type19(i_reg, value, width, bitrev, dest_xor),
         Instruction::IndirectBranch {
             call,
             cond,
             pm_i,
             pm_m,
             delayed,
-            ..
-        } => encode_type9a(call, cond, pm_i, pm_m, delayed),
+            compute,
+            else_compute,
+        } => encode_type9a(call, cond, pm_i, pm_m, delayed, compute, else_compute),
         Instruction::EmuIdle => Ok((1u64 << 39) | (1u64 << 38)),
         Instruction::Sync => Ok(1u64 << 38),
         Instruction::BitOp { op, sreg, data } => {
-            let op_hi = ((op >> 1) & 1) as u64;
-            let op_lo = (op & 1) as u64;
+            if !matches!(op, 0 | 1 | 2 | 4 | 5) {
+                return Err(EncodeError {
+                    msg: format!("BIT operation {op} is not SET/CLR/TGL/TST/XOR"),
+                });
+            }
             let word = (0x14u64 << 40)
-                | (op_hi << 39)
-                | (op_lo << 37)
+                | ((op as u64) << 37)
                 | ((sreg as u64 & 0x1F) << 32)
                 | (data as u64);
             Ok(word)
         }
         Instruction::StackOp { ops } => Ok((0x17u64 << 40) | ((ops as u64) << 33)),
-        Instruction::CJump { addr, delayed } => {
+        Instruction::CJump {
+            addr,
+            delayed,
+            relative,
+        } => {
             let db = if delayed { 1u64 << 34 } else { 0 };
-            Ok((0x18u64 << 40) | db | (addr as u64 & 0xFFFFFF))
+            Ok((0x18u64 << 40) | ((relative as u64) << 38) | db | (addr as u64 & 0xFFFFFF))
         }
         Instruction::UregDagMove {
             pm,
@@ -680,15 +812,17 @@ pub fn encode_word(instr: &Instruction) -> Result<u64, EncodeError> {
             cond,
             compute,
             post_modify,
+            width,
         } => encode_type3(
             &UregDagMoveArgs {
-                _pm: pm,
+                pm,
                 write,
                 ureg,
                 i_reg,
                 m_reg,
                 cond,
                 post_modify,
+                width,
             },
             &compute,
         ),
@@ -698,18 +832,50 @@ pub fn encode_word(instr: &Instruction) -> Result<u64, EncodeError> {
             m_reg,
             cond,
             compute,
+            dest_xor,
+            width,
         } => {
             let comp = encode_compute_opt(&compute)?;
             let g = if pm { 1u64 } else { 0 };
-            // Standard Type 7 (bit39=0): g at bit38, i_field at bits[37:35],
-            // m_field at bits[34:32], cond at bits[27:23], compute at bits[22:0]
+            // The reference assembler: `i0 = modify ( i4 , m4 ) ( sw )` = 043f24800000,
+            // `r0 = r2 and r1 , i2 = modify ( i2 , m6 ) ( nw )` = 04beb0040021.
+            let width_bits = match width {
+                MemWidth::Normal => 0,
+                MemWidth::Nw => 1u64 << 39,
+                MemWidth::Sw => 1u64 << 23,
+            };
+            // Type 7: g at bit38, cond at bits[37:33], i at bits[32:30],
+            // m at bits[29:27], dest XOR i at bits[26:24], compute at [22:0].
+            // The reference assembler: `i0 = modify(i1,m4)` = 043e61000000,
+            // `f8 = f10*f7, i0 = modify(i1,m4)` = 043e611308a7.
             let word = (0x04u64 << 40)
                 | (g << 38)
-                | ((i_reg as u64 & 0x7) << 35)
-                | ((m_reg as u64 & 0x7) << 32)
-                | ((cond as u64 & 0x1F) << 23)
+                | ((cond as u64 & 0x1F) << 33)
+                | ((i_reg as u64 & 0x7) << 30)
+                | ((m_reg as u64 & 0x7) << 27)
+                | ((dest_xor as u64 & 0x7) << 24)
+                | width_bits
                 | (comp as u64);
             Ok(word)
+        }
+        Instruction::DagConvert {
+            pm,
+            dest_xor,
+            i_reg,
+            op,
+            cond,
+            compute,
+        } => {
+            let comp = encode_compute_opt(&compute)?;
+            Ok((0x04u64 << 40)
+                | (1u64 << 39)
+                | (u64::from(pm) << 38)
+                | ((cond as u64 & 0x1F) << 33)
+                | ((i_reg as u64 & 0x7) << 30)
+                | ((op as u64 & 0x3) << 27)
+                | ((dest_xor as u64 & 0x7) << 24)
+                | (1u64 << 23)
+                | (comp as u64))
         }
         Instruction::RegisterSwap {
             dreg,
@@ -780,8 +946,8 @@ pub fn encode_word(instr: &Instruction) -> Result<u64, EncodeError> {
             dreg,
             cond,
         } => {
-            let op_field = ((shift_type as u64 & 0x7) << 4) | (sub_op as u64 & 0xF);
-            let len_hi = len_hi | shift_sign_extension(op_field as u8, imm);
+            let op_field = type6_shift_op(shift_type, sub_op)?;
+            let len_hi = shift_dataex(op_field, imm, len_hi);
             let d = if write { 1u64 } else { 0 };
             Ok((0b100u64 << 45)
                 | ((i_reg as u64 & 0xF) << 41)
@@ -806,14 +972,8 @@ pub fn encode_word(instr: &Instruction) -> Result<u64, EncodeError> {
             write,
             ureg,
             addr,
-        } => encode_type14(pm, write, ureg, addr),
-        Instruction::SubWordAbsAccess {
-            write,
-            short,
-            signed,
-            dreg,
-            addr,
-        } => encode_type14d(write, short, signed, dreg, addr),
+            width,
+        } => encode_type14(pm, write, ureg, addr, width),
     }
 }
 
@@ -841,7 +1001,7 @@ fn pack_be(word: u64) -> [u8; 6] {
 // Compute field encoder (23 bits)
 // ---------------------------------------------------------------------------
 
-fn encode_compute(op: &ComputeOp) -> Result<u32, EncodeError> {
+pub(crate) fn encode_compute(op: &ComputeOp) -> Result<u32, EncodeError> {
     match *op {
         ComputeOp::Alu(ref alu) => encode_alu(alu),
         ComputeOp::Falu(ref falu) => encode_falu(falu),
@@ -915,6 +1075,10 @@ fn encode_alu(op: &AluOp) -> Result<u32, EncodeError> {
 
 fn encode_falu(op: &FaluOp) -> Result<u32, EncodeError> {
     let (opcode, rn, rx, ry): (u8, u16, u16, u16) = match *op {
+        FaluOp::DualAddSub { rn, rs, rx, ry } => {
+            check_reg4("rs", rs)?;
+            (0xF0 | rs as u8, rn, rx, ry)
+        }
         FaluOp::Add { rn, rx, ry } => (0x81, rn, rx, ry),
         FaluOp::Sub { rn, rx, ry } => (0x82, rn, rx, ry),
         FaluOp::Avg { rn, rx, ry } => (0x89, rn, rx, ry),
@@ -1002,6 +1166,12 @@ fn encode_mul(op: &MulOp) -> Result<u32, EncodeError> {
         MulOp::MrfMulSsf { rx, ry } => (0x7C, 0, rx, ry),
         MulOp::MrfMulUuf { rx, ry } => (0x4C, 0, rx, ry),
         MulOp::MrfMulUui { rx, ry } => (0x44, 0, rx, ry),
+        MulOp::FixedMul { opcode, rn, rx, ry } if opcode >= 0x40 => (opcode, rn, rx, ry),
+        MulOp::FixedMul { opcode, .. } => {
+            return Err(EncodeError {
+                msg: format!("multiplier opcode 0x{opcode:02X} is not a fixed-point multiply"),
+            })
+        }
         // mrb = Rx * Ry family.
         MulOp::MrbMulSsf { rx, ry } => (0x7E, 0, rx, ry),
         // Rn = mrf + Rx*Ry and accumulator-MAC variants.
@@ -1015,8 +1185,14 @@ fn encode_mul(op: &MulOp) -> Result<u32, EncodeError> {
         MulOp::ClrMrf => (0x14, 0, 0, 0),
         MulOp::ClrMrb => (0x16, 0, 0, 0),
         // `Rn = sat mrf/mrb` at `0000 fNNx` with f=1 (fractional).
-        MulOp::SatMrf { rn } => (0x08, rn, 0, 0),
-        MulOp::SatMrb { rn } => (0x0A, rn, 0, 0),
+        // Unsuffixed `Rn = SAT MRF|MRB` is the (SF) form: the reference assembler 01909000 /
+        // 0190b000. 0x08/0x0A are (UF).
+        MulOp::SatMrf { rn } => (0x09, rn, 0, 0),
+        MulOp::SatMrb { rn } => (0x0B, rn, 0, 0),
+        // The reference assembler: `r0 = sat mrf (si)` = 01901000, `r10 = sat mrf ( sf )` =
+        // 01909a00, `r0 = sat mrb (si)` = 01903000, `r0 = rnd mrf (sf)` =
+        // 01919000, `r0 = rnd mrb (sf)` = 0191b000.
+        MulOp::MrToReg { opcode, rn } => (opcode, rn, 0, 0),
         // TRNC variants live only in the 64-bit multiplier
         // encoding; these single-function placeholders are unused
         // by selcc / selas today.
@@ -1107,6 +1283,8 @@ fn encode_shift(op: &ShiftOp) -> Result<u32, EncodeError> {
         ShiftOp::Lefto { rn, rx } => (0x8C, rn, rx, 0),
         ShiftOp::Fpack { rn, rx } => (0x90, rn, rx, 0),
         ShiftOp::Funpack { rn, rx } => (0x94, rn, rx, 0),
+        ShiftOp::BffwrpRead { rn } => (0x70, rn, 0, 0),
+        ShiftOp::BffwrpWrite { ry } => (0x7C, 0, 0, ry),
         ShiftOp::Bset { rn, rx, ry } => (0xC0, rn, rx, ry),
         ShiftOp::Bclr { rn, rx, ry } => (0xC4, rn, rx, ry),
         ShiftOp::Btgl { rn, rx, ry } => (0xC8, rn, rx, ry),
@@ -1141,10 +1319,41 @@ fn encode_multi(op: &MultiOp) -> Result<u32, EncodeError> {
             //   bits[21:16] = mf_op
             //   bits[15:0]  = register fields
             // For 32-bit fixed: mf_op = 0b0_mm_aa (mm=mul_sel, aa=alu_sel)
-            // For 32/40-bit float: mf_op = 0b011_mm_aa
+            // For 32/40-bit float: mf_op = 0b011_aaa, the multiply is
+            // always Fm = Fxm * Fym and aaa picks the ALU operation:
+            // 0 +, 1 -, 2 FLOAT BY, 4 (a+b)/2, 5 ABS, 6 MAX, 7 MIN (the reference assembler
+            // vectors, e.g.
+            // `f0 = f3 * f4, f8 = max(f8, f14), ...` compute 0x5e08c2). The
+            // old `0b011_mm_aa` turned (a+b)/2 into 0x1a, FLOAT BY.
             let mf_op = if fp {
-                0b011_000u32 | ((mul_sel as u32 & 3) << 2) | (alu_sel as u32 & 3)
+                let aaa = match alu_sel {
+                    0 => 0,
+                    1 => 1,
+                    2 => 4,
+                    3 => 2,
+                    4 => 5,
+                    5 => 6,
+                    6 => 7,
+                    _ => {
+                        return Err(EncodeError {
+                            msg: format!("unknown float multifunction ALU select {alu_sel}"),
+                        })
+                    }
+                };
+                if mul_sel != 0 {
+                    return Err(EncodeError {
+                        msg: "a float multifunction multiply must be Fm = Fxm * Fym".into(),
+                    });
+                }
+                0b011_000u32 | aaa
             } else {
+                if alu_sel > 2 {
+                    return Err(EncodeError {
+                        msg: format!(
+                            "fixed-point multifunction ALU select {alu_sel} is float-only"
+                        ),
+                    });
+                }
                 ((mul_sel as u32 & 3) << 2) | (alu_sel as u32 & 3)
             };
             let field = (1u32 << 22)
@@ -1218,11 +1427,19 @@ fn encode_type11a(
     let x = if interrupt { 1u64 } else { 0u64 };
     let j = if delayed { 1u64 } else { 0u64 };
     let lr_bit = if lr { 1u64 } else { 0u64 };
+    // RTI is opcode 0x0B (bit 40), as in the reference assembler's 16-bit returns (`rts`
+    // = 0abe, `rti` = 0bbe, `rti (db)` = 0bfe, also in a vendor library
+    // dispatcher). There is no vendor 48-bit RTI vector; selas
+    // set bit 39, which made a 48-bit `rti` start with the parcel 0abe, the
+    // 16-bit `rts`. The 48-bit RTS (`rts (db) , f0 = f0 + f0` =
+    // 0a3e04081000) keeps bit 39 clear.
     let word = (0x0Au64 << 40)
-        | (x << 39)
+        | (x << 40)
         | ((cond as u64 & 0x1F) << 33)
         | (j << 26)
-        | (lr_bit << 25)
+        // LR is bit 24: the reference assembler `if ne rts (lr)` = 0a2001000000;
+        // selas had bit 25.
+        | (lr_bit << 24)
         | (comp as u64);
     Ok(word)
 }
@@ -1290,19 +1507,49 @@ fn encode_branch(
 // bits[22:0] = compute (0 for no compute)
 // ---------------------------------------------------------------------------
 
+/// Type 9a: `[IF cond] JUMP|CALL (Mm, Ii) [(DB)] [, [ELSE] compute]`.
+///
+/// The reference assembler layout: CALL bit 39,
+/// cond 37:33, I 32:30, M 29:27, (DB) 26, ELSE 25, compute 22:0. Vectors:
+/// `jump (m12, i12), r4 = r1 + r2` = 083f20001412,
+/// `if eq jump (m14, i8), else f1 = abs f8` = 0800320b0180,
+/// `if lt jump (m14, i8) (db)` = 0802343f (32-bit form). The I field used
+/// to sit at 26:24 and (DB) at 32, inside the I field. `pm_i`/`pm_m` are
+/// DAG2 registers, absolute (8..15) or DAG2-relative (0..7, as selcc
+/// builds them); only the low three bits are encoded.
 fn encode_type9a(
     call: bool,
     cond: u8,
     pm_i: u8,
     pm_m: u8,
     delayed: bool,
+    compute: Option<ComputeOp>,
+    else_compute: bool,
 ) -> Result<u64, EncodeError> {
+    if else_compute && (compute.is_none() || cond == 31 || delayed || call) {
+        return Err(EncodeError {
+            msg: "ELSE on an indirect branch is only supported as \
+                  `IF cond JUMP (Mm, Ii), ELSE compute`"
+                .into(),
+        });
+    }
+    if call && compute.is_some() {
+        return Err(EncodeError {
+            msg: "CALL (Mm, Ii) with a compute has no vendor vector".into(),
+        });
+    }
     let j = if call { 1u64 } else { 0u64 };
     let db = if delayed { 1u64 } else { 0u64 };
-    let cond_bits = (cond as u64 & 0x1F) << 33;
-    let pmi_bits = ((pm_i & 0x07) as u64) << 24;
-    let pmm_bits = ((pm_m & 0x07) as u64) << 27;
-    let word = (0x08u64 << 40) | (j << 39) | cond_bits | (db << 32) | pmi_bits | pmm_bits;
+    let els = if else_compute { 1u64 } else { 0u64 };
+    let comp = encode_compute_opt(&compute)?;
+    let word = (0x08u64 << 40)
+        | (j << 39)
+        | ((cond as u64 & 0x1F) << 33)
+        | (((pm_i & 7) as u64) << 30)
+        | (((pm_m & 7) as u64) << 27)
+        | (db << 26)
+        | (els << 25)
+        | u64::from(comp);
     Ok(word)
 }
 
@@ -1322,27 +1569,73 @@ fn encode_type9a(
 //
 // Bit layout (from disasm.rs decode_type3):
 //   bits[47:45] = 010
-//   bit[44]     = DAG select (1 = (I,M) order, 0 = (M,I) order)
+//   bit[44]     = U (1 = DM(Ii,Mm) post-modify, 0 = DM(Mm,Ii) pre-modify)
 //   bits[43:41] = i_addr (I register index, 0-7)
-//   bit[40]     = (don't-care for encoding, typically 0)
-//   bits[39:38] = m_offset (M register = m_offset + 4, so M4-M7)
+//   bits[40:38] = m register (M0-M7)
 //   bits[37:33] = cond (31 = TRUE = unconditional)
 //   bit[31]     = d (direction: 0=read, 1=write)
+//   bit[30]     = short-word flag with bits[21:20]=11 (see DagWidth)
 //   bits[29:23] = ureg code (7 bits)
 //   bits[22:0]  = compute
 // ---------------------------------------------------------------------------
 
 struct UregDagMoveArgs {
-    _pm: bool,
+    pm: bool,
     write: bool,
     ureg: u16,
     i_reg: u8,
     m_reg: u8,
     cond: u8,
     post_modify: bool,
+    width: DagWidth,
 }
 
 fn encode_type3(a: &UregDagMoveArgs, compute: &Option<ComputeOp>) -> Result<u64, EncodeError> {
+    // G (PM, DAG2) is bit 32: set on all 616 reference assembler PM rows,
+    // clear on all 18,457 DM rows (`f0 = f0 * f4 , f8 = pm(i8, m8)` =
+    // 503f04130004). PM was refused. No vendor PM (sw)/(bw) vector.
+    if a.pm && a.width != DagWidth::Normal {
+        return Err(EncodeError {
+            msg: "(sw)/(bw) PM DAG access has no vendor vector".into(),
+        });
+    }
+    // The reference assembler 48-bit vectors (hardware-loop bodies, 2026-09 listings):
+    // (SW) sets bit 30 and bits 21:20, (BW) sets bits 21:20 only, e.g.
+    // `r0=dm(i0,m6)(sw)` = 51be40300000, `r12=dm(m5,i4)(bw)` = 497e06300000.
+    // Only M4-M7 without a parallel compute are vendor-observed.
+    // Sign-extending widths set bit 16 as well: `r0=dm(m4,i2) (swse)` =
+    // 453e40310000, `r12=dm(i0,m6) (bwse)` = 51be06310000 (the reference assembler
+    // objects, loop tails).
+    let width_bits = match a.width {
+        DagWidth::Normal => 0u64,
+        DagWidth::Short => (1u64 << 30) | (0b11u64 << 20),
+        DagWidth::Byte => 0b11u64 << 20,
+        // Sign extension applies to loads only (no SE store in the reference assembler).
+        DagWidth::ShortSe if compute.is_none() && !a.write => {
+            (1u64 << 30) | (0b11u64 << 20) | (1 << 16)
+        }
+        DagWidth::ByteSe if compute.is_none() && !a.write => (0b11u64 << 20) | (1 << 16),
+        // (LW) with a parallel compute is bit 30 (114 the reference assembler rows, all
+        // data registers): `comp ( f12 , f0 ) , r0 = dm ( i4 , m4 ) ( lw )` =
+        // 593e4008a0c0, `r0 = pass r9 , r14 = dm ( i3 , m2 ) ( lw )` =
+        // 56be47021090. No 48-bit vector without a compute.
+        DagWidth::Long if compute.is_some() && a.ureg < 0x10 => 1u64 << 30,
+        DagWidth::Long | DagWidth::ShortSe | DagWidth::ByteSe => {
+            return Err(EncodeError {
+                msg: "(lw)/(swse)/(bwse) DAG access has no 48-bit vendor vector".into(),
+            })
+        }
+    };
+    if matches!(
+        a.width,
+        DagWidth::Short | DagWidth::Byte | DagWidth::ShortSe | DagWidth::ByteSe
+    ) && (compute.is_some() || a.m_reg < 4)
+    {
+        return Err(EncodeError {
+            msg: "(sw)/(bw) DAG access is only supported for M4-M7 without a parallel compute"
+                .into(),
+        });
+    }
     if a.i_reg > 7 {
         return Err(EncodeError {
             msg: format!("Type 3 I register index {} out of range (0-7)", a.i_reg),
@@ -1364,8 +1657,10 @@ fn encode_type3(a: &UregDagMoveArgs, compute: &Option<ComputeOp>) -> Result<u64,
         | ((a.i_reg as u64 & 0x7) << 41)
         | (m_field << 38)
         | ((a.cond as u64 & 0x1F) << 33)
+        | (u64::from(a.pm) << 32)
         | (d << 31)
         | ((a.ureg as u64 & 0x7F) << 23)
+        | width_bits
         | (comp as u64);
     Ok(word)
 }
@@ -1378,8 +1673,16 @@ fn encode_type4(
     dreg: u16,
     offset: i8,
     cond: u8,
+    post_modify: bool,
 ) -> Result<u64, EncodeError> {
     check_reg4("dreg", dreg)?;
+    if access.pm {
+        // Bit 38 is the update (post-modify) bit in the reference assembler's encoding; the
+        // PM select position has no vendor vector yet.
+        return Err(EncodeError {
+            msg: "PM immediate-modify (Type 4) access is not supported".into(),
+        });
+    }
     if access.i_reg > 7 {
         return Err(EncodeError {
             msg: format!("I register index {} out of range (0-7)", access.i_reg),
@@ -1393,7 +1696,7 @@ fn encode_type4(
     }
     let comp = encode_compute_opt(&compute)?;
     let data6 = (offset as u8 as u32) & 0x3F; // mask to 6 bits
-    let g = if access.pm { 1u64 } else { 0u64 };
+    let u = if post_modify { 1u64 } else { 0u64 };
     let d = if access.write { 1u64 } else { 0u64 };
 
     // Type 4 bit layout (from disasm.rs decode_type4):
@@ -1402,7 +1705,9 @@ fn encode_type4(
     //   bits[43:41] = i_addr (I register index, 0-7)
     //   bit[40]     = 0
     //   bit[39]     = d (direction: 0=read, 1=write)
-    //   bit[38]     = g (0=DM, 1=PM)
+    //   bit[38]     = u (1 = DM(Ii,data6) post-modify), the reference assembler vectors:
+    //                 `dm(i1, 0x2) = r4` = 62fe12000000,
+    //                 `dm(-3,i6) = r15` (with compute) = 6cbfef821200
     //   bits[37:33] = cond (31 = TRUE)
     //   bits[32:27] = data6 (6-bit signed offset)
     //   bits[26:23] = dm_dreg (data register index)
@@ -1411,7 +1716,7 @@ fn encode_type4(
         // bit44 = 0 (type 4)
         | ((access.i_reg as u64 & 0x7) << 41)  // bits[43:41]
         | (d << 39)                              // bit[39]
-        | (g << 38)                              // bit[38]
+        | (u << 38)                              // bit[38]
         | ((cond as u64 & 0x1F) << 33)           // bits[37:33]
         | ((data6 as u64) << 27)                 // bits[32:27]
         | ((dreg as u64 & 0xF) << 23)            // bits[26:23]
@@ -1431,12 +1736,13 @@ fn encode_type4(
 // bits[23:0] = addr24
 // ---------------------------------------------------------------------------
 
-fn encode_do_loop(counter: LoopCounter, end_pc: u32) -> Result<u64, EncodeError> {
-    if end_pc > 0xFFFFFF {
+fn encode_do_loop(counter: LoopCounter, end_pc: u32, f: bool) -> Result<u64, EncodeError> {
+    if end_pc > 0xFFFFFF || (f && end_pc > 0x7FFFFF) {
         return Err(EncodeError {
-            msg: format!("loop end address 0x{end_pc:X} exceeds 24 bits"),
+            msg: format!("loop end address 0x{end_pc:X} exceeds the address field"),
         });
     }
+    let end_pc = end_pc | if f { 0x80_0000 } else { 0 };
     match counter {
         LoopCounter::Immediate(count) => {
             let word = (0x0Cu64 << 40) | ((count as u64) << 24) | (end_pc as u64);
@@ -1518,22 +1824,35 @@ fn encode_type1(
 // bits[31:0] = data32 (32-bit immediate, treated as unsigned in encoding)
 // ---------------------------------------------------------------------------
 
-fn encode_type19(i_reg: u8, value: i32, width: MemWidth, bitrev: bool) -> Result<u64, EncodeError> {
-    if i_reg > 15 {
+fn encode_type19(
+    i_reg: u8,
+    value: i32,
+    width: MemWidth,
+    bitrev: bool,
+    dest_xor: u8,
+) -> Result<u64, EncodeError> {
+    if i_reg > 15 || dest_xor > 7 || (bitrev && dest_xor != 0) {
         return Err(EncodeError {
-            msg: format!("I register index {i_reg} out of range (0-15)"),
+            msg: format!("unsupported MODIFY/BITREV registers (I{i_reg}, dest xor {dest_xor})"),
         });
     }
+    // bits[37:35] = destination XOR source (the reference assembler: `i2 = modify(i4,
+    // 0x1a)` = 16340000001a, `i4 = modify(i7, 1)(nw)` = 159f00000001).
+    let dest_field = (dest_xor as u64) << 35;
     let g: u64 = if i_reg >= 8 { 1 } else { 0 };
     let i_field = (i_reg & 7) as u64;
     let data32 = (value as u32) as u64;
 
     match width {
         MemWidth::Normal => {
-            // Standard Type 19 (sub=0x16): i_src at bits[34:32]
-            // bit[38] = BREV (1 for BITREV, 0 for MODIFY)
+            // Standard Type 19 (sub=0x16): bit 39 = BITREV, bit 38 = DAG
+            // select, i_src at bits[34:32]. The reference assembler:
+            // `bitrev (i0, 0x10)` = 168000000010,
+            // `i10 = modify(i10, 0x4)` = 164200000004. The two bits were
+            // swapped, so a DAG2 MODIFY ran as a DAG1 BITREV.
             let brev = if bitrev { 1u64 } else { 0 };
-            let word = (0x16u64 << 40) | (g << 39) | (brev << 38) | (i_field << 32) | data32;
+            let word =
+                (0x16u64 << 40) | (brev << 39) | (g << 38) | dest_field | (i_field << 32) | data32;
             Ok(word)
         }
         MemWidth::Nw | MemWidth::Sw => {
@@ -1547,7 +1866,12 @@ fn encode_type19(i_reg: u8, value: i32, width: MemWidth, bitrev: bool) -> Result
             } else {
                 0
             };
-            let word = (0x15u64 << 40) | (nw_bit << 39) | (g << 38) | (i_field << 32) | data32;
+            let word = (0x15u64 << 40)
+                | (nw_bit << 39)
+                | (g << 38)
+                | dest_field
+                | (i_field << 32)
+                | data32;
             Ok(word)
         }
     }
@@ -1592,44 +1916,47 @@ fn encode_type16(pm: bool, i_reg: u8, m_reg: u8, value: u32) -> Result<u64, Enco
 // bits[31:0]  = addr32
 // ---------------------------------------------------------------------------
 
-fn encode_type14(pm: bool, write: bool, ureg: u16, addr: u32) -> Result<u64, EncodeError> {
+fn encode_type14(
+    pm: bool,
+    write: bool,
+    ureg: u16,
+    addr: u32,
+    width: DagWidth,
+) -> Result<u64, EncodeError> {
     let g = if pm { 1u64 } else { 0 };
     let d = if write { 1u64 } else { 0 };
-    let word = (0b000_100u64 << 42) | (g << 41) | (d << 40) | ((ureg as u64) << 32) | (addr as u64);
-    Ok(word)
-}
-
-// ---------------------------------------------------------------------------
-// Type 14d: Dreg<->DM, absolute 32-bit address, byte or short word (PRM Figure 16-2)
-// bits[47:41] = 0001101
-// bit[40]     = d (0=read, 1=write)
-// bit[39]     = ex (exclusive access, 0 here)
-// bit[38]     = l (0=byte, 1=short word)
-// bit[37]     = w (0 for byte and short word)
-// bit[36]     = x (sign-extend, loads only)
-// bits[35:32] = dreg
-// bits[31:0]  = addr32
-// ---------------------------------------------------------------------------
-
-fn encode_type14d(
-    write: bool,
-    short: bool,
-    signed: bool,
-    dreg: u16,
-    addr: u32,
-) -> Result<u64, EncodeError> {
-    check_reg4("14d dreg", dreg)?;
-    if write && signed {
+    if width == DagWidth::Normal {
+        let word =
+            (0b000_100u64 << 42) | (g << 41) | (d << 40) | ((ureg as u64) << 32) | (addr as u64);
+        return Ok(word);
+    }
+    // Widths: DM data registers only; sign extension only on loads
+    // (the reference assembler has no other rows).
+    let se = matches!(width, DagWidth::ShortSe | DagWidth::ByteSe);
+    if pm || ureg > 0x0F || (se && write) {
         return Err(EncodeError {
-            msg: "14d: sign extension is only for loads".into(),
+            msg: "an absolute-address width needs DM and a data register (sign extension: loads)"
+                .into(),
         });
     }
-    Ok((0b0001101u64 << 41)
-        | ((write as u64) << 40)
-        | ((short as u64) << 38)
-        | ((signed as u64) << 36)
-        | ((dreg as u64) << 32)
-        | (addr as u64))
+    let word = match width {
+        // (LW): Type 14 with bit 39 (`r0 = dm(0x1)(lw)` = 108000000001,
+        // `dm(-0x7d1fff18) = r10(lw)` = 118a82e000e8).
+        DagWidth::Long => (0x10u64 << 40) | (d << 40) | (1 << 39) | ((ureg as u64) << 32),
+        // Type 14b: 0x1a read / 0x1b write, bit 38 short, bit 36 sign
+        // extension, bits 35:32 the register (`r0 = dm(0x252718)(bw)` =
+        // 1a0000252718, `dm(0x1) = r4(sw)` = 1b4400000001, `r11 =
+        // dm(0x1)(swse)` = 1a5b00000001).
+        _ => {
+            let short = u64::from(matches!(width, DagWidth::Short | DagWidth::ShortSe));
+            (0x1Au64 << 40)
+                | (d << 40)
+                | (short << 38)
+                | (u64::from(se) << 36)
+                | ((ureg as u64) << 32)
+        }
+    };
+    Ok(word | addr as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -1740,36 +2067,9 @@ fn encode_type15(
 }
 
 fn type15_ureg_code(ureg: u16) -> Option<u16> {
-    let mapped = match ureg {
-        0x00..=0x5F => ureg,
-        0x60 => 0x60, // FADDR
-        0x61 => 0x61, // DADDR
-        0x62 => 0x63, // PC
-        0x63 => 0x64, // PCSTK
-        0x64 => 0x65, // PCSTKP
-        0x65 => 0x66, // LADDR
-        0x66 => 0x67, // CURLCNTR
-        0x67 => 0x68, // LCNTR
-        0x68 => 0x69, // EMUCLK
-        0x69 => 0x6A, // EMUCLK2
-        0x6C => 0x6B, // PX
-        0x6D => 0x6C, // PX1
-        0x6E => 0x6D, // PX2
-        0x70 => 0x72, // MODE1
-        0x71 => 0x74, // MODE2
-        0x72 => 0x75, // FLAGS
-        0x73 => 0x76, // ASTATx
-        0x74 => 0x77, // ASTATy
-        0x75 => 0x78, // STKYx
-        0x76 => 0x79, // STKYy
-        0x78 => 0x7A, // IRPTL
-        0x79 => 0x7B, // IMASK
-        0x7A => 0x7C, // IMASKP
-        0x7B => 0x7D, // MODE1STK
-        0x80..=0xFF => return None,
-        _ => return None,
-    };
-    Some(mapped)
+    // The 7-bit field holds the universal register code unchanged: vendor
+    // `astaty = dm(-0x100, i6)` = ac77ffffff00 (ASTATy = 0x77).
+    (ureg <= 0x7F).then_some(ureg)
 }
 
 // ---------------------------------------------------------------------------
@@ -1781,13 +2081,45 @@ fn type15_ureg_code(ureg: u16) -> Option<u16> {
 // bits[3:0]   = Rx
 // ---------------------------------------------------------------------------
 
-/// The 4-bit `dataex` field (frame bits 30-27) that carries the sign extension of the 8-bit count of a signed immediate shift: LSHIFT 0x00,
-/// ASHIFT 0x01, OR LSHIFT 0x08, OR ASHIFT 0x09 (PRM Table 17-9 shiftimm opcodes) are 0xF for a negative count and 0 otherwise.
-fn shift_sign_extension(op_field: u8, imm: u8) -> u8 {
-    if matches!(op_field, 0x00 | 0x01 | 0x08 | 0x09) && imm & 0x80 != 0 {
+/// Type 6 SHIFTOP field (bits[21:16]): the register-form shifter opcode
+/// shifted right by two. The reference assembler vectors: LSHIFT 0x00 (023e00000e22),
+/// ASHIFT 0x01 (023e7801f122), OR LSHIFT 0x08 (023e00081000), FEXT 0x10
+/// (023e00108000), BTST 0x33 (023e00330000). OR ASHIFT 0x09 composes the
+/// verified ASHIFT and OR bits; it has no direct vendor vector.
+/// `sub_op` 4 marks the OR forms of LSHIFT/ASHIFT (asmparse).
+fn type6_shift_op(shift_type: u8, sub_op: u8) -> Result<u64, EncodeError> {
+    Ok(match (shift_type, sub_op) {
+        (0, 0) => 0x00,
+        // ROT: `r0 = rot r0 by 5` = 023e00020500.
+        (0, 2) => 0x02,
+        (0, 4) => 0x08,
+        (2, 0) => 0x01,
+        (2, 4) => 0x09,
+        // Shift type 1: the immediate opcode is the register opcode >> 2
+        // (FEXT 0x40 -> 0x10, FEXT (SE) 0x48 -> 0x12, OR FDEP 0x64 ->
+        // 0x19); sub_op is its low nibble. Only forms with the reference assembler
+        // vectors: FEXT 023e4010002f, FEXT (SE) 023e10121014, OR FDEP
+        // 023e0019500c, BITEXT 023e00142000, BITDEP 023e001d2000,
+        // BFFWRP = imm 023e001f1000. selas used 0x11 for OR FDEP (that
+        // is FDEP) and 0x13 for FDEP (FDEP (SE)).
+        (1, 0 | 2 | 4 | 9 | 0xD | 0xF) | (3, 0..=3) => ((shift_type as u64) << 4) | sub_op as u64,
+        _ => {
+            return Err(EncodeError {
+                msg: format!("unsupported immediate shift type {shift_type} sub-op {sub_op}"),
+            })
+        }
+    })
+}
+
+/// The reference assembler sign-extends a negative LSHIFT/ASHIFT count into the DATAEX
+/// field bits[30:27], in Type 6b and in Type 6a alike: `r0 = lshift r0 by
+/// -4` = 023e7800fc00, `r2 = ashift r2 by -15` = 023e7801f122, `r0 =
+/// ashift r12 by -0x10 , dm(i5, m0) = r..` = 8a3efd81f00c.
+fn shift_dataex(op_field: u64, imm: u8, data_hi: u8) -> u8 {
+    if op_field & 0x30 == 0 && (imm as i8) < 0 && data_hi == 0 {
         0xF
     } else {
-        0
+        data_hi
     }
 }
 
@@ -1800,8 +2132,8 @@ fn encode_type6b(
     data_hi: u8,
     cond: u8,
 ) -> Result<u64, EncodeError> {
-    let op_field = ((shift_type as u64 & 0xF) << 4) | (sub_op as u64 & 0xF);
-    let data_hi = data_hi | shift_sign_extension(op_field as u8, imm);
+    let op_field = type6_shift_op(shift_type, sub_op)?;
+    let data_hi = shift_dataex(op_field, imm, data_hi);
     let word = (0x02u64 << 40)
         | ((cond as u64 & 0x1F) << 33)
         | ((data_hi as u64 & 0x1F) << 27)
@@ -1829,6 +2161,18 @@ mod tests {
         lines.into_iter().next().unwrap().text
     }
 
+    #[test]
+    fn rframe_matches_vendor_nw_and_sw_vectors() {
+        // RFRAME = 190000000000 in NW. The same source instruction
+        // in SW is the 16-bit 1901.
+        let instr = Instruction::Rframe;
+        assert_eq!(encode(&instr).unwrap(), [0x19, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            crate::visa_encode::encode_visa(&instr).unwrap().to_bytes(),
+            [0x19, 0x01]
+        );
+    }
+
     // -- Type 17: LoadImm --
 
     #[test]
@@ -1852,7 +2196,7 @@ mod tests {
     #[test]
     fn roundtrip_load_imm_mode1() {
         let text = roundtrip(&Instruction::LoadImm {
-            ureg: 0x70,
+            ureg: 0x72,
             value: 0x00001000,
         });
         assert_eq!(text, "MODE1 = 0x1000");
@@ -2259,7 +2603,7 @@ mod tests {
             cond: 31,
             compute: ComputeOp::Mul(MulOp::SatMrf { rn: 3 }),
         });
-        assert_eq!(text, "R3 = SAT MRF");
+        assert_eq!(text, "R3 = SAT MRF (SF)");
     }
 
     #[test]
@@ -2271,13 +2615,23 @@ mod tests {
         assert_eq!(text, "MRF = 0");
     }
 
+    /// The reference assembler has no TRNC form: the opcode selas
+    /// used for `Rn = TRNC MRF` (0x1C) is `MRF = RND MRF (UF)`.
     #[test]
-    fn roundtrip_trnc_mrf_reg() {
+    fn trnc_opcode_decodes_as_vendor_rnd_uf() {
         let text = roundtrip(&Instruction::Compute {
             cond: 31,
-            compute: ComputeOp::Mul(MulOp::TrncMrfReg { rn: 5 }),
+            compute: ComputeOp::Mul(MulOp::TrncMrfReg { rn: 0 }),
         });
-        assert_eq!(text, "R5 = TRNC MRF");
+        assert_eq!(text, "MRF = RND MRF (UF)");
+        let text = roundtrip(&Instruction::Compute {
+            cond: 31,
+            compute: ComputeOp::Mul(MulOp::MrToReg {
+                opcode: 0x06,
+                rn: 0,
+            }),
+        });
+        assert_eq!(text, "MRB = SAT MRB (UI)");
     }
 
     // -- SHIFT --
@@ -2422,6 +2776,7 @@ mod tests {
             cond: 31,
             delayed: false,
             target: BranchTarget::Absolute(0x001234),
+            loop_abort: false,
         });
         assert_eq!(text, "JUMP 0x001234");
     }
@@ -2433,6 +2788,7 @@ mod tests {
             cond: 31,
             delayed: false,
             target: BranchTarget::Absolute(0x005678),
+            loop_abort: false,
         });
         assert_eq!(text, "CALL 0x005678");
     }
@@ -2444,6 +2800,7 @@ mod tests {
             cond: 16, // NE
             delayed: false,
             target: BranchTarget::Absolute(0x000100),
+            loop_abort: false,
         });
         assert_eq!(text, "IF NE JUMP 0x000100");
     }
@@ -2455,6 +2812,7 @@ mod tests {
             cond: 31,
             delayed: false,
             target: BranchTarget::PcRelative(10),
+            loop_abort: false,
         });
         assert_eq!(text, "JUMP (PC,0xA)");
     }
@@ -2466,6 +2824,7 @@ mod tests {
             cond: 31,
             delayed: false,
             target: BranchTarget::PcRelative(-5),
+            loop_abort: false,
         });
         assert_eq!(text, "JUMP (PC,-0x5)");
     }
@@ -2484,13 +2843,17 @@ mod tests {
             dreg: 0,
             offset: 1,
             cond: 31,
+            post_modify: false,
+            width: DagWidth::Normal,
         });
         assert_eq!(text, "R0=DM (0x1,I0)");
     }
 
     #[test]
-    fn roundtrip_pm_store_imm_offset() {
-        let text = roundtrip(&Instruction::ComputeLoadStore {
+    fn pm_store_imm_offset_is_rejected() {
+        // The reference assembler uses bit 38 as the Type 4 update bit (62fe12000000 is a DM
+        // post-modify store), so it cannot also select PM.
+        assert!(encode(&Instruction::ComputeLoadStore {
             compute: None,
             access: MemAccess {
                 pm: true,
@@ -2500,8 +2863,10 @@ mod tests {
             dreg: 5,
             offset: -3,
             cond: 31,
-        });
-        assert_eq!(text, "PM (-0x3,I2)=R5");
+            post_modify: false,
+            width: DagWidth::Normal,
+        })
+        .is_err());
     }
 
     #[test]
@@ -2520,6 +2885,8 @@ mod tests {
             dreg: 4,
             offset: 0,
             cond: 31,
+            post_modify: false,
+            width: DagWidth::Normal,
         });
         assert_eq!(text, "R0 = R1 + R2 , R4=DM (0x0,I3)");
     }
@@ -2536,6 +2903,8 @@ mod tests {
             dreg: 0,
             offset: 1,
             cond: 0, // EQ
+            post_modify: false,
+            width: DagWidth::Normal,
         });
         assert_eq!(text, "IF EQ R0=DM (0x1,I0)");
     }
@@ -2547,6 +2916,7 @@ mod tests {
         let text = roundtrip(&Instruction::DoLoop {
             counter: LoopCounter::Immediate(100),
             end_pc: 0x002000,
+            f: false,
         });
         assert_eq!(text, "LCNTR = 0x64 , DO (PC,0x2000)UNTIL LCE");
     }
@@ -2556,6 +2926,7 @@ mod tests {
         let text = roundtrip(&Instruction::DoLoop {
             counter: LoopCounter::Ureg(0x05), // R5
             end_pc: 0x003000,
+            f: false,
         });
         assert_eq!(text, "LCNTR = R5, DO 0x003000 UNTIL LCE");
     }
@@ -2649,6 +3020,7 @@ mod tests {
             cond: 31,
             delayed: false,
             target: BranchTarget::Absolute(0x1000000),
+            loop_abort: false,
         });
         assert!(result.is_err());
     }
@@ -2678,6 +3050,8 @@ mod tests {
             dreg: 0,
             offset: 33,
             cond: 31,
+            post_modify: false,
+            width: DagWidth::Normal,
         });
         assert!(result.is_err());
     }
@@ -2845,6 +3219,7 @@ mod tests {
             value: -4,
             width: MemWidth::Normal,
             bitrev: false,
+            dest_xor: 0,
         };
         let bytes = encode(&instr).expect("encode failed");
         let lines = disasm::disassemble(&bytes, 0, false);
@@ -2859,6 +3234,7 @@ mod tests {
             value: 16,
             width: MemWidth::Normal,
             bitrev: false,
+            dest_xor: 0,
         };
         let text = roundtrip(&instr);
         assert_eq!(text, "I0=MODIFY (I0,0x10)");
@@ -2871,6 +3247,7 @@ mod tests {
             value: 0x100,
             width: MemWidth::Normal,
             bitrev: false,
+            dest_xor: 0,
         };
         let text = roundtrip(&instr);
         assert_eq!(text, "I10=MODIFY (I10,0x100)");
@@ -2922,25 +3299,27 @@ mod tests {
 
     #[test]
     fn roundtrip_multi_mul_alu_float() {
-        // F0 = MRF + F1 * F4 , F8 = F8 + F12
-        // Note: float multifunction only supports mul_sel 2 and 3
-        // (mul_sel occupies mf_op[3:2] but bit 3 is always 1 for float)
-        let instr = Instruction::Compute {
+        // The reference assembler `f4 = f2 * f4 , f0 = f9 + f12` = 01d84084 (compute 0x584084):
+        // the float multiply is always
+        // Fm = Fxm * Fym. A float multiply into MRF has no encoding.
+        let mul_alu = |mul_sel| Instruction::Compute {
             cond: 31,
             compute: ComputeOp::Multi(MultiOp::MulAlu {
                 fp: true,
-                mul_sel: 2,
+                mul_sel,
                 alu_sel: 0,
-                rm: 0,
-                ra: 8,
-                rxm: 1,
+                rm: 4,
+                ra: 0,
+                rxm: 2,
                 rym: 0,
-                rxa: 0,
+                rxa: 1,
                 rya: 0,
             }),
         };
-        let text = roundtrip(&instr);
-        assert_eq!(text, "F0 = MRF + F1 * F4 , F8 = F8 + F12");
+        let word = encode(&mul_alu(0)).unwrap();
+        assert_eq!(word[3..], [0x58, 0x40, 0x84]);
+        assert_eq!(roundtrip(&mul_alu(0)), "F4 = F2 * F4 , F0 = F9 + F12");
+        assert!(encode(&mul_alu(2)).is_err());
     }
 
     #[test]
@@ -2972,7 +3351,7 @@ mod tests {
             i_reg: 6,
             write: true,
             lw: false,
-            ureg: 0x73,
+            ureg: 0x76,
             offset: -0x1af,
         };
         let bytes = encode(&instr).expect("encode failed");
@@ -3086,8 +3465,8 @@ mod tests {
     #[test]
     fn roundtrip_imm_ashift() {
         let instr = Instruction::ImmShift {
-            shift_type: 0,
-            sub_op: 1,
+            shift_type: 2,
+            sub_op: 0,
             imm: 8,
             rn: 2,
             rx: 3,

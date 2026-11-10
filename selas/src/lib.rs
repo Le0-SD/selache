@@ -79,7 +79,13 @@ pub fn run(opts: &cli::Options) -> error::Result<()> {
         .proc
         .as_deref()
         .is_some_and(|p| p.eq_ignore_ascii_case("ADSP-21569"));
-    let bytes = assemble::assemble_source(&processed, is_visa)?;
+    let options = assemble::AsmOptions {
+        auto_fast_loops: !opts.no_auto_fast_loops,
+        nwc: opts.nwc,
+        swc_exclude: &opts.swc_exclude,
+        ..assemble::AsmOptions::default()
+    };
+    let bytes = assemble::assemble_source_with(&processed, is_visa, options)?;
     std::fs::write(&opts.output, bytes)?;
 
     if opts.verbose {
@@ -95,10 +101,8 @@ mod tests {
 
     #[test]
     fn test_find_toolchain_root() {
-        // Project-local scratch (fast_data/tmp), not the shared /tmp:
-        // a fixed name under /tmp collides with other users' leftovers
-        // and AGENTS.md forbids /tmp. The pid keeps it unique per run.
-        let tmp = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
+        // Keep scratch inside the checkout. The pid keeps it unique per run.
+        let tmp = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/test-tmp"))
             .join(format!("test_selache_root_{}", std::process::id()));
         let _ = std::fs::create_dir_all(tmp.join("libsel/include"));
         let _ = std::fs::create_dir_all(tmp.join("target/release"));

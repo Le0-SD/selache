@@ -25,7 +25,9 @@ use crate::mach::{MachInstr, Reloc, RelocKind};
 use crate::regalloc;
 use crate::target;
 
-use selinstr::encode::{self, AluOp, BranchTarget, ComputeOp, Instruction, MemAccess, MemWidth};
+use selinstr::encode::{
+    self, AluOp, BranchTarget, ComputeOp, DagWidth, Instruction, MemAccess, MemWidth,
+};
 
 /// A fully-emitted asm module: the text ready to be handed to selas.
 pub struct AsmModule {
@@ -3583,7 +3585,9 @@ fn instr_uses_reg(instr: &Instruction, reg: u16) -> bool {
         Instruction::ComputeLoadStore { dreg, compute, .. } => {
             dreg == reg || compute.is_some_and(|c| compute_uses_reg(&c, reg))
         }
-        Instruction::IndirectBranch { compute, .. } | Instruction::DagModify { compute, .. } => {
+        Instruction::IndirectBranch { compute, .. }
+        | Instruction::DagModify { compute, .. }
+        | Instruction::DagConvert { compute, .. } => {
             compute.is_some_and(|c| compute_uses_reg(&c, reg))
         }
         Instruction::DoLoop {
@@ -3641,7 +3645,9 @@ fn instr_writes_reg(instr: &Instruction, reg: u16) -> bool {
             compute,
             ..
         } => (!access.write && dreg == reg) || compute.is_some_and(|c| compute_writes_reg(&c, reg)),
-        Instruction::IndirectBranch { compute, .. } | Instruction::DagModify { compute, .. } => {
+        Instruction::IndirectBranch { compute, .. }
+        | Instruction::DagModify { compute, .. }
+        | Instruction::DagConvert { compute, .. } => {
             compute.is_some_and(|c| compute_writes_reg(&c, reg))
         }
         Instruction::Return { compute, .. } => compute.is_some_and(|c| compute_writes_reg(&c, reg)),
@@ -3715,6 +3721,7 @@ fn mul_writes_reg(op: &selinstr::encode::MulOp, reg: u16) -> bool {
         | MacSsf { rn, .. }
         | SatMrf { rn }
         | SatMrb { rn }
+        | MrToReg { rn, .. }
         | TrncMrfReg { rn }
         | TrncMrbReg { rn }
         | ReadMr0f { rn }
@@ -3747,8 +3754,9 @@ fn shift_writes_reg(op: &selinstr::encode::ShiftOp, reg: u16) -> bool {
         | Leftz { rn, .. }
         | Lefto { rn, .. }
         | Fpack { rn, .. }
-        | Funpack { rn, .. } => rn == reg,
-        Btst { .. } => false,
+        | Funpack { rn, .. }
+        | BffwrpRead { rn } => rn == reg,
+        Btst { .. } | BffwrpWrite { .. } => false,
     }
 }
 
@@ -3763,6 +3771,7 @@ fn multi_writes_reg(op: &selinstr::encode::MultiOp, reg: u16) -> bool {
 fn falu_writes_reg(op: &selinstr::encode::FaluOp, reg: u16) -> bool {
     use selinstr::encode::FaluOp::*;
     match *op {
+        DualAddSub { rn, rs, .. } => rn == reg || rs == reg,
         Add { rn, .. }
         | Sub { rn, .. }
         | Avg { rn, .. }
@@ -3977,6 +3986,7 @@ fn build_prologue(
                 value: -(frame_size as i32) - extra,
                 width: MemWidth::Nw,
                 bitrev: false,
+                dest_xor: 0,
             },
             reloc: None,
         });
@@ -3994,6 +4004,8 @@ fn build_prologue(
                 dreg: reg,
                 offset: slot_offset,
                 cond: target::COND_TRUE,
+                post_modify: false,
+                width: selinstr::encode::DagWidth::Normal,
             },
             reloc: None,
         });
@@ -4025,6 +4037,8 @@ fn build_epilogue(
                 dreg: reg,
                 offset: slot_offset,
                 cond: target::COND_TRUE,
+                post_modify: false,
+                width: selinstr::encode::DagWidth::Normal,
             },
             reloc: None,
         });
@@ -4039,6 +4053,7 @@ fn build_epilogue(
                 value: frame_size as i32 + extra,
                 width: MemWidth::Nw,
                 bitrev: false,
+                dest_xor: 0,
             },
             reloc: None,
         });
@@ -4162,6 +4177,8 @@ fn adjust_frame_offsets(
                         dreg,
                         offset: 0,
                         cond,
+                        post_modify: false,
+                        width: selinstr::encode::DagWidth::Normal,
                     },
                 reloc,
             }),
@@ -4221,6 +4238,7 @@ fn adjust_frame_offsets(
                         cond,
                         compute,
                         post_modify,
+                        width,
                     },
                 reloc,
             }),
@@ -4248,11 +4266,12 @@ fn adjust_frame_offsets(
                     -(spill_base + value + 1)
                 };
                 let start = result.len();
-                if *ureg == 0x73
+                if *ureg == 0x76 // ASTATx
                     && *m_reg == 5
                     && *cond == target::COND_TRUE
                     && compute.is_none()
                     && !*post_modify
+                    && *width == DagWidth::Normal
                     && reloc.is_none()
                 {
                     result.push(MachInstr {
@@ -4273,6 +4292,7 @@ fn adjust_frame_offsets(
                             value: new_offset,
                             width: MemWidth::Nw,
                             bitrev: false,
+                            dest_xor: 0,
                         },
                         reloc: None,
                     });
@@ -4286,6 +4306,7 @@ fn adjust_frame_offsets(
                             cond: *cond,
                             compute: *compute,
                             post_modify: *post_modify,
+                            width: *width,
                         },
                         reloc: reloc.clone(),
                     });
@@ -4295,6 +4316,7 @@ fn adjust_frame_offsets(
                             value: -new_offset,
                             width: MemWidth::Nw,
                             bitrev: false,
+                            dest_xor: 0,
                         },
                         reloc: None,
                     });
@@ -4312,6 +4334,8 @@ fn adjust_frame_offsets(
                 dreg,
                 offset,
                 cond,
+                post_modify: false,
+                width: selinstr::encode::DagWidth::Normal,
             } if access.i_reg == target::FRAME_PTR && !access.pm => {
                 let orig = offset as i32;
                 let new_offset = if orig < 0 {
@@ -4347,6 +4371,7 @@ fn adjust_frame_offsets(
                         // every `DM(offset, I6)` access in the body.
                         width: MemWidth::Nw,
                         bitrev: false,
+                        dest_xor: 0,
                     },
                     reloc: mi.reloc.clone(),
                 });
@@ -4377,6 +4402,8 @@ fn emit_adjusted_access(
                 dreg,
                 offset: new_offset as i8,
                 cond,
+                post_modify: false,
+                width: selinstr::encode::DagWidth::Normal,
             },
             reloc,
         });
@@ -4407,6 +4434,7 @@ fn emit_adjusted_access(
                 value: new_offset,
                 width: MemWidth::Nw,
                 bitrev: false,
+                dest_xor: 0,
             },
             reloc: None,
         });
@@ -4417,6 +4445,8 @@ fn emit_adjusted_access(
                 dreg,
                 offset: 0,
                 cond,
+                post_modify: false,
+                width: selinstr::encode::DagWidth::Normal,
             },
             reloc,
         });
@@ -4426,6 +4456,7 @@ fn emit_adjusted_access(
                 value: -new_offset,
                 width: MemWidth::Nw,
                 bitrev: false,
+                dest_xor: 0,
             },
             reloc: None,
         });
@@ -4441,6 +4472,8 @@ fn expand_large_frame_offsets(instrs: &[MachInstr]) -> Vec<MachInstr> {
             dreg,
             offset,
             cond,
+            post_modify: false,
+            width: selinstr::encode::DagWidth::Normal,
         } = mi.instr
         {
             let off = offset as i32;
@@ -4612,6 +4645,8 @@ fn frame_store(instr: &Instruction) -> Option<(u16, i8)> {
             dreg,
             offset,
             cond,
+            post_modify: false,
+            width: selinstr::encode::DagWidth::Normal,
         } if i_reg == target::FRAME_PTR && cond == target::COND_TRUE && dreg < 0x10 => {
             Some((dreg, offset))
         }
@@ -4632,6 +4667,8 @@ fn frame_load(instr: &Instruction) -> Option<(u16, i8)> {
             dreg,
             offset,
             cond,
+            post_modify: false,
+            width: selinstr::encode::DagWidth::Normal,
         } if i_reg == target::FRAME_PTR && cond == target::COND_TRUE && dreg < 0x10 => {
             Some((dreg, offset))
         }
@@ -4666,6 +4703,8 @@ fn rewrite_frame_load_dreg(mi: &MachInstr, new_dreg: u16) -> MachInstr {
                 dreg: new_dreg,
                 offset,
                 cond,
+                post_modify: false,
+                width: selinstr::encode::DagWidth::Normal,
             },
             reloc: mi.reloc.clone(),
         },
@@ -4685,6 +4724,8 @@ fn swap_sources(mi: &MachInstr, a: u16, b: u16) -> Option<MachInstr> {
             dreg,
             offset,
             cond,
+            post_modify: false,
+            width: selinstr::encode::DagWidth::Normal,
         } => {
             let new_compute = compute.map(|c| swap_compute_sources(&c, a, b));
             let new_dreg = if access.write {
@@ -4698,6 +4739,8 @@ fn swap_sources(mi: &MachInstr, a: u16, b: u16) -> Option<MachInstr> {
                 dreg: new_dreg,
                 offset,
                 cond,
+                post_modify: false,
+                width: selinstr::encode::DagWidth::Normal,
             }
         }
         _ => return None,
@@ -4810,7 +4853,8 @@ fn is_conditional_branch(instr: &Instruction) -> bool {
             call: false,
             cond,
             delayed: false,
-            target: BranchTarget::PcRelative(_)
+            target: BranchTarget::PcRelative(_),
+            loop_abort: false,
         } if cond != target::COND_TRUE
     )
 }
@@ -5002,6 +5046,7 @@ fn try_fuse_multifunction(a: &Instruction, b: &Instruction) -> Option<Instructio
             m_reg,
             cond,
             post_modify,
+            width,
             ..
         } => Instruction::UregDagMove {
             pm,
@@ -5012,6 +5057,7 @@ fn try_fuse_multifunction(a: &Instruction, b: &Instruction) -> Option<Instructio
             cond,
             compute: Some(compute),
             post_modify,
+            width,
         },
         Instruction::ComputeLoadStore {
             access,
@@ -5025,6 +5071,8 @@ fn try_fuse_multifunction(a: &Instruction, b: &Instruction) -> Option<Instructio
             dreg,
             offset,
             cond,
+            post_modify: false,
+            width: selinstr::encode::DagWidth::Normal,
         },
         _ => return None,
     };
@@ -5054,6 +5102,7 @@ fn mf_is_fusable_mem(instr: &Instruction) -> bool {
     match *instr {
         Instruction::UregDagMove {
             compute: None,
+            width: DagWidth::Normal,
             cond,
             ureg,
             ..
@@ -5163,6 +5212,7 @@ fn forward_frameaddr_spill_to_hidden_arg(
                         value: m0_value,
                         width: m0_width,
                         bitrev: false,
+                        dest_xor: 0,
                     },
                     Instruction::UregTransfer {
                         src_ureg,
@@ -5175,6 +5225,7 @@ fn forward_frameaddr_spill_to_hidden_arg(
                         value: m1_value,
                         width: m1_width,
                         bitrev: false,
+                        dest_xor: 0,
                     },
                     Instruction::ComputeLoadStore {
                         compute: None,
@@ -5182,6 +5233,8 @@ fn forward_frameaddr_spill_to_hidden_arg(
                         dreg: store_reg,
                         offset: store_offset,
                         cond: store_cond,
+                        post_modify: false,
+                        width: selinstr::encode::DagWidth::Normal,
                     },
                     middle,
                     Instruction::ComputeLoadStore {
@@ -5190,6 +5243,8 @@ fn forward_frameaddr_spill_to_hidden_arg(
                         dreg: load_reg,
                         offset: load_offset,
                         cond: load_cond,
+                        post_modify: false,
+                        width: selinstr::encode::DagWidth::Normal,
                     },
                     Instruction::Compute {
                         cond: pass_cond,
@@ -5773,6 +5828,8 @@ fn remap_sources(mi: &MachInstr, from: u16, to: u16) -> MachInstr {
             dreg,
             offset,
             cond,
+            post_modify: false,
+            width: selinstr::encode::DagWidth::Normal,
         } => {
             let new_compute = compute.map(|c| remap_compute_sources(&c, from, to));
             let new_dreg = if access.write && dreg == from {
@@ -5786,6 +5843,8 @@ fn remap_sources(mi: &MachInstr, from: u16, to: u16) -> MachInstr {
                 dreg: new_dreg,
                 offset,
                 cond,
+                post_modify: false,
+                width: selinstr::encode::DagWidth::Normal,
             }
         }
         Instruction::UregMemAccess {
@@ -5935,6 +5994,7 @@ fn resolve_branches(
                 cond,
                 delayed: false,
                 target: BranchTarget::PcRelative(label_as_i32),
+                loop_abort: false,
             } if mi.reloc.is_none() => {
                 // Route same-function branches through a synthetic local
                 // label and let selas compute RELADDR at assembly time in
@@ -5959,6 +6019,7 @@ fn resolve_branches(
                         cond,
                         delayed: false,
                         target: BranchTarget::Absolute(0),
+                        loop_abort: false,
                     },
                     Some(Reloc {
                         symbol: name,
@@ -5966,7 +6027,7 @@ fn resolve_branches(
                     }),
                 )
             }
-            Instruction::DoLoop { counter, end_pc } => {
+            Instruction::DoLoop { counter, end_pc, f } => {
                 // Emit a synthetic local label at the last-body-instruction
                 // position and reference it from the DO instruction, so that
                 // selas computes RELADDR in the right unit for the target
@@ -5982,7 +6043,11 @@ fn resolve_branches(
                     slot.push(name.clone());
                 }
                 (
-                    Instruction::DoLoop { counter, end_pc: 0 },
+                    Instruction::DoLoop {
+                        counter,
+                        end_pc: 0,
+                        f,
+                    },
                     Some(Reloc {
                         symbol: name,
                         kind: RelocKind::Addr24,
@@ -6077,6 +6142,7 @@ mod tests {
                     value: 128,
                     width: MemWidth::Nw,
                     bitrev: false,
+                    dest_xor: 0,
                 },
                 reloc: None,
             },
@@ -6093,6 +6159,8 @@ mod tests {
                     dreg: 3,
                     offset: 0,
                     cond: target::COND_TRUE,
+                    post_modify: false,
+                    width: selinstr::encode::DagWidth::Normal,
                 },
                 reloc: None,
             },
@@ -6102,6 +6170,7 @@ mod tests {
                     value: -128,
                     width: MemWidth::Nw,
                     bitrev: false,
+                    dest_xor: 0,
                 },
                 reloc: None,
             },
@@ -6162,6 +6231,7 @@ mod tests {
                 cond: target::COND_TRUE,
                 compute: None,
                 post_modify: true,
+                width: DagWidth::Normal,
             },
             reloc: None,
         };
@@ -6169,6 +6239,7 @@ mod tests {
             instr: Instruction::CJump {
                 addr: 0,
                 delayed: true,
+                relative: false,
             },
             reloc: None,
         };
@@ -6233,6 +6304,7 @@ mod tests {
                 cond: target::COND_TRUE,
                 compute: None,
                 post_modify: true,
+                width: DagWidth::Normal,
             },
             reloc: None,
         }];
@@ -6374,6 +6446,8 @@ mod tests {
                     dreg: 2,
                     offset: -1,
                     cond: target::COND_TRUE,
+                    post_modify: false,
+                    width: selinstr::encode::DagWidth::Normal,
                 },
                 reloc: None,
             },
@@ -6387,6 +6461,7 @@ mod tests {
                     cond: target::COND_NE,
                     delayed: false,
                     target: BranchTarget::PcRelative(2),
+                    loop_abort: false,
                 },
                 reloc: None,
             },
@@ -6400,6 +6475,8 @@ mod tests {
                     dreg: 3,
                     offset: -1,
                     cond: target::COND_TRUE,
+                    post_modify: false,
+                    width: selinstr::encode::DagWidth::Normal,
                 },
                 reloc: None,
             },

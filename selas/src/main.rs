@@ -23,6 +23,8 @@ fn print_usage() {
     eprintln!("Options:");
     eprintln!("    -o <file>          Output file (default: input.doj)");
     eprintln!("    -proc <processor>  Target processor (e.g. ADSP-21569)");
+    eprintln!("    -nwc               Default code sections to normal-word encoding");
+    eprintln!("    -swc-exclude <s,..> Use normal words in named sections unless /SW");
     eprintln!("    -I <dir>           Add include search directory");
     eprintln!("    -D <sym>[=value]   Define preprocessor symbol");
     eprintln!("    --preprocess-only  Preprocess only, do not assemble");

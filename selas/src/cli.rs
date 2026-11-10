@@ -14,6 +14,13 @@ pub struct Options {
     pub include_dirs: Vec<String>,
     pub defines: Vec<(String, String)>,
     pub preprocess_only: bool,
+    /// The reference assembler `-no-auto-fast-loops`: set a DO loop's fast bit only for
+    /// an explicit `(F)`.
+    pub no_auto_fast_loops: bool,
+    /// The reference assembler `-nwc`: default code to word-addressed 48-bit form.
+    pub nwc: bool,
+    /// Exact section names excluded from default short-word encoding.
+    pub swc_exclude: Vec<String>,
 }
 
 pub fn parse_args(args: &[String]) -> Result<Options> {
@@ -25,6 +32,9 @@ pub fn parse_args(args: &[String]) -> Result<Options> {
     let mut include_dirs: Vec<String> = Vec::new();
     let mut defines: Vec<(String, String)> = Vec::new();
     let mut preprocess_only = false;
+    let mut no_auto_fast_loops = false;
+    let mut nwc = false;
+    let mut swc_exclude = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -46,6 +56,21 @@ pub fn parse_args(args: &[String]) -> Result<Options> {
                 proc = Some(args[i].clone());
             }
             "--preprocess-only" => preprocess_only = true,
+            "-no-auto-fast-loops" => no_auto_fast_loops = true,
+            "-nwc" => nwc = true,
+            "-swc-exclude" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .filter(|s| !s.starts_with('-'))
+                    .ok_or_else(|| Error::MissingArgument("-swc-exclude".into()))?;
+                for name in value.split(',').map(str::trim) {
+                    if name.is_empty() {
+                        return Err(Error::MissingArgument("-swc-exclude section name".into()));
+                    }
+                    swc_exclude.push(name.to_owned());
+                }
+            }
             arg if arg.starts_with("-I") => {
                 let dir = &arg[2..];
                 if dir.is_empty() {
@@ -114,11 +139,19 @@ pub fn parse_args(args: &[String]) -> Result<Options> {
             include_dirs,
             defines,
             preprocess_only,
+            no_auto_fast_loops,
+            nwc,
+            swc_exclude,
         });
     }
 
     let input = input.ok_or(Error::NoInput)?;
+    // `--preprocess-only` without `-o` prints to stdout: defaulting to
+    // `<stem>.doj` overwrote the object next to the source with text.
     let output = output.unwrap_or_else(|| {
+        if preprocess_only {
+            return String::new();
+        }
         let stem = input
             .strip_suffix(".s")
             .or_else(|| input.strip_suffix(".asm"))
@@ -135,6 +168,9 @@ pub fn parse_args(args: &[String]) -> Result<Options> {
         include_dirs,
         defines,
         preprocess_only,
+        no_auto_fast_loops,
+        nwc,
+        swc_exclude,
     })
 }
 
@@ -176,6 +212,28 @@ mod tests {
     fn test_proc_flag() {
         let opts = parse_args(&args(&["-proc", "ADSP-21569", "test.s"])).unwrap();
         assert_eq!(opts.proc.as_deref(), Some("ADSP-21569"));
+        assert!(!opts.nwc);
+        let opts = parse_args(&args(&["-nwc", "-proc", "ADSP-21569", "test.s"])).unwrap();
+        assert!(opts.nwc);
+        assert_eq!(opts.input, "test.s");
+    }
+
+    #[test]
+    fn swc_exclude_section_lists() {
+        // The reference object retains
+        // `-swc-exclude seg_l2code,seg_p_fanout` in .commandLine.
+        let opts = parse_args(&args(&[
+            "-swc-exclude",
+            "seg_l2code,seg_p_fanout",
+            "-swc-exclude",
+            "extra",
+            "test.s",
+        ]))
+        .unwrap();
+        assert_eq!(opts.swc_exclude, ["seg_l2code", "seg_p_fanout", "extra"]);
+        assert_eq!(opts.input, "test.s");
+        assert!(parse_args(&args(&["test.s", "-swc-exclude"])).is_err());
+        assert!(parse_args(&args(&["-swc-exclude", "-nwc", "test.s"])).is_err());
     }
 
     #[test]
@@ -195,6 +253,10 @@ mod tests {
     fn test_preprocess_only() {
         let opts = parse_args(&args(&["--preprocess-only", "test.s"])).unwrap();
         assert!(opts.preprocess_only);
+        assert_eq!(opts.output, "", "must print to stdout, not write test.doj");
+        assert!(!opts.no_auto_fast_loops);
+        let opts = parse_args(&args(&["-no-auto-fast-loops", "test.s"])).unwrap();
+        assert!(opts.no_auto_fast_loops);
     }
 
     #[test]

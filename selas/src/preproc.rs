@@ -189,6 +189,11 @@ impl Preprocessor {
                 let expanded = self.expand_macros(raw_line);
                 // Strip // line comments
                 let without_comment = strip_line_comment(&expanded);
+                if let Some(bytes) = self.expand_inc_binary(without_comment, filename, line_num)? {
+                    output.push_str(&bytes);
+                    output.push('\n');
+                    continue;
+                }
                 output.push_str(without_comment);
                 output.push('\n');
             } else {
@@ -546,6 +551,82 @@ impl Preprocessor {
         }
 
         Ok(())
+    }
+
+    /// `.INC/BINARY name[] = "file" [, skip [, count]];` becomes the
+    /// equivalent `.BYTE name[count] = …;`. The reference assembler copies the file slice
+    /// verbatim (`.inc/binary .sLINEAR.54[]
+    /// = "wp.sbn", 0, 131;` is wp.sbn's 131 bytes, symbol size 131).
+    /// selas used to ignore the directive, dropping the data and leaving
+    /// the symbol undefined.
+    fn expand_inc_binary(
+        &self,
+        line: &str,
+        filename: &str,
+        line_num: usize,
+    ) -> Result<Option<String>> {
+        let trimmed = line.trim();
+        if !trimmed
+            .get(..12)
+            .is_some_and(|k| k.eq_ignore_ascii_case(".INC/BINARY "))
+        {
+            return Ok(None);
+        }
+        let err = |msg: String| Error::Parse {
+            line: line_num as u32,
+            msg,
+        };
+        let body = trimmed[12..].trim().trim_end_matches(';').trim();
+        let (name, rest) = body.split_once('=').ok_or_else(|| {
+            err(format!(
+                "expected `.INC/BINARY name[] = \"file\"`: {trimmed}"
+            ))
+        })?;
+        let name = name
+            .trim()
+            .strip_suffix("[]")
+            .map(str::trim)
+            .filter(|n| !n.is_empty() && !n.contains(char::is_whitespace))
+            .ok_or_else(|| err(format!("expected `name[]` in .INC/BINARY: {trimmed}")))?;
+        let rest = rest.trim();
+        let close = rest
+            .strip_prefix('"')
+            .and_then(|r| r.find('"'))
+            .ok_or_else(|| err(format!("expected a quoted file name: {trimmed}")))?;
+        let file = &rest[1..close + 1];
+        let mut nums = Vec::new();
+        for part in rest[close + 2..]
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            let v = if let Some(h) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+                usize::from_str_radix(h, 16).ok()
+            } else {
+                part.parse::<usize>().ok()
+            };
+            nums.push(v.ok_or_else(|| err(format!("invalid .INC/BINARY count `{part}`")))?);
+        }
+        let path = self
+            .resolve_include(file, filename, false)
+            .ok_or_else(|| err(format!(".INC/BINARY file not found: {file}")))?;
+        let data = std::fs::read(&path).map_err(|e| err(format!("{}: {e}", path.display())))?;
+        let skip = nums.first().copied().unwrap_or(0);
+        let count = match nums.get(1) {
+            Some(&c) => c,
+            None => data.len().saturating_sub(skip),
+        };
+        if nums.len() > 2 || count == 0 || skip + count > data.len() {
+            return Err(err(format!(
+                ".INC/BINARY {file}: skip {skip} + count {count} does not fit its {} bytes",
+                data.len()
+            )));
+        }
+        let values: Vec<String> = data[skip..skip + count].iter().map(u8::to_string).collect();
+        Ok(Some(format!(
+            ".BYTE {name}[{count}] = {};",
+            values.join(",")
+        )))
     }
 
     fn resolve_include(

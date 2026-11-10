@@ -467,20 +467,10 @@ fn place_output_section(
 
                 let input_align = sec.sh_addralign;
                 let effective_align = sec_align.max(input_align);
-                // SW/PM code sections: rounds each
-                // input section's allocation to a 4-byte boundary
-                // (2-parcel alignment). Sections whose byte size is
-                // 2 mod 4 get 2 bytes of padding so the next section
-                // starts at a 4-byte-aligned offset.
-                let alloc_size = if matches!(
-                    out_sec.qualifier,
-                    SectionQualifier::Sw | SectionQualifier::Pm
-                ) {
-                    (size + 3) & !3
-                } else {
-                    size
-                };
-                let addr = cursor.allocate(alloc_size, effective_align, &out_sec.name)?;
+                // Allocate the actual bytes. Any following section applies
+                // its own alignment; rounding code size to four bytes here
+                // rejects vendor six-byte patch slots.
+                let addr = cursor.allocate(size, effective_align, &out_sec.name)?;
 
                 placed.push(PlacedSection {
                     output_name: out_sec.name.clone(),

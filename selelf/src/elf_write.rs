@@ -134,12 +134,24 @@ impl ElfWriter {
     /// bank entirely). The `addralign=8` matches the expected symbol
     /// alignment for byte-width data.
     pub fn add_data_section(&mut self, name: &str, data: &[u8]) -> u16 {
+        self.add_data_section_aligned(name, data, 8)
+    }
+
+    /// Add byte-addressed data with the source section's explicit alignment.
+    pub fn add_data_section_aligned(&mut self, name: &str, data: &[u8], alignment: u32) -> u16 {
         let idx = self.add_section(name, SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, data);
         if let Some(sec) = self.sections.last_mut() {
             sec.entsize = 1;
-            sec.alignment = 8;
+            sec.alignment = alignment;
         }
         idx
+    }
+
+    /// Plain /DM words occupy five file bytes; header units and alignment
+    /// are one word (the reference assembler).
+    /// Tag_Encoding=1 in .adi.attributes identifies this layout.
+    pub fn add_data_section_dm(&mut self, name: &str, data: &[u8]) -> u16 {
+        self.add_data_section_aligned(name, data, 1)
     }
 
     /// Add a read-only data section (SHT_PROGBITS, SHF_ALLOC).
